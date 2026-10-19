@@ -1,3 +1,8 @@
+"""Weather API client for the Open-Meteo Weather API.
+
+Exposes fetch_weather() for pipeline use and main() for standalone execution.
+Variable definitions are the verified production set (aligned with save_raw_data notebook).
+"""
 import os
 from pathlib import Path
 
@@ -5,114 +10,97 @@ import requests
 import yaml
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(PROJECT_ROOT / ".env")
+# ── Default API URL (public Open-Meteo endpoint) ──
+DEFAULT_API_URL = "https://api.open-meteo.com/v1/forecast"
 
-WEATHER_API_URL = os.getenv("WEATHER_API_URL")
-LOCATIONS_FILE = PROJECT_ROOT / "config" / "locations.yaml"
+# ── Weather API variables (verified against Open-Meteo docs) ──
+WEATHER_CURRENT_VARS = ",".join([
+    "temperature_2m", "relative_humidity_2m", "apparent_temperature",
+    "is_day", "precipitation", "rain", "snowfall", "weather_code",
+    "cloud_cover", "pressure_msl", "surface_pressure",
+    "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m",
+])
+
+WEATHER_HOURLY_VARS = ",".join([
+    "temperature_2m", "relative_humidity_2m", "dew_point_2m",
+    "apparent_temperature", "precipitation", "rain", "snowfall",
+    "snow_depth", "weather_code", "pressure_msl", "surface_pressure",
+    "cloud_cover", "cloud_cover_low", "cloud_cover_mid", "cloud_cover_high",
+    "visibility", "wind_speed_10m", "wind_speed_80m",
+    "wind_direction_10m", "wind_direction_80m", "wind_gusts_10m",
+    "soil_temperature_0cm", "soil_temperature_6cm", "soil_temperature_18cm", "soil_temperature_54cm",
+    "soil_moisture_0_to_1cm", "soil_moisture_1_to_3cm", "soil_moisture_3_to_9cm",
+    "soil_moisture_9_to_27cm", "soil_moisture_27_to_81cm",
+    "uv_index", "uv_index_clear_sky", "is_day", "sunshine_duration",
+    "wet_bulb_temperature_2m", "vapour_pressure_deficit",
+    "shortwave_radiation", "direct_radiation", "diffuse_radiation",
+    "direct_normal_irradiance", "terrestrial_radiation",
+])
+
+WEATHER_DAILY_VARS = ",".join([
+    "weather_code", "temperature_2m_max", "temperature_2m_min",
+    "apparent_temperature_max", "apparent_temperature_min",
+    "sunrise", "sunset", "daylight_duration", "sunshine_duration",
+    "uv_index_max", "precipitation_sum", "rain_sum", "snowfall_sum",
+    "precipitation_hours", "precipitation_probability_max",
+    "wind_speed_10m_max", "wind_gusts_10m_max", "wind_direction_10m_dominant",
+    "shortwave_radiation_sum", "et0_fao_evapotranspiration",
+])
+
+
+def fetch_weather(latitude, longitude, api_url=None):
+    """Fetch comprehensive weather data for a single location.
+
+    Args:
+        latitude: Location latitude.
+        longitude: Location longitude.
+        api_url: Weather API endpoint. Falls back to DEFAULT_API_URL if not provided.
+
+    Returns:
+        Tuple of (data, params) where data is the raw API response dict
+        and params is the request parameters dict.
+    """
+    url = api_url or DEFAULT_API_URL
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": WEATHER_CURRENT_VARS,
+        "hourly": WEATHER_HOURLY_VARS,
+        "daily": WEATHER_DAILY_VARS,
+        "forecast_days": 1,
+        "timezone": "UTC",
+    }
+
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+
+    if not data or "latitude" not in data:
+        raise ValueError("Empty or malformed weather response")
+
+    return data, params
 
 
 def load_locations():
-    with open(LOCATIONS_FILE) as f:
+    """Load locations from config/locations.yaml for standalone use."""
+    project_root = Path(__file__).resolve().parents[2]
+    locations_file = project_root / "config" / "locations.yaml"
+    with open(locations_file) as f:
         config = yaml.safe_load(f)
     return config["locations"]
 
 
-def fetch_weather(latitude, longitude):
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "timezone": "UTC",
-
-        "current": (
-            "temperature_2m,"
-            "relative_humidity_2m,"
-            "apparent_temperature,"
-            "dew_point_2m,"
-            "is_day,"
-            "precipitation,"
-            "rain,"
-            "showers,"
-            "snowfall,"
-            "weather_code,"
-            "cloud_cover,"
-            "pressure_msl,"
-            "surface_pressure,"
-            "wind_speed_10m,"
-            "wind_direction_10m,"
-            "wind_gusts_10m"
-        ),
-
-        "hourly": (
-            "temperature_2m,"
-            "relative_humidity_2m,"
-            "apparent_temperature,"
-            "dew_point_2m,"
-            "precipitation_probability,"
-            "precipitation,"
-            "rain,"
-            "showers,"
-            "snowfall,"
-            "weather_code,"
-            "pressure_msl,"
-            "surface_pressure,"
-            "cloud_cover,"
-            "cloud_cover_low,"
-            "cloud_cover_mid,"
-            "cloud_cover_high,"
-            "visibility,"
-            "wind_speed_10m,"
-            "wind_direction_10m,"
-            "wind_gusts_10m,"
-            "uv_index,"
-            "uv_index_clear_sky,"
-            "is_day,"
-            "sunshine_duration,"
-            "shortwave_radiation,"
-            "et0_fao_evapotranspiration,"
-            "vapour_pressure_deficit,"
-            "soil_temperature_0_to_7cm,"
-            "soil_moisture_0_to_7cm"
-        ),
-
-        "daily": (
-            "weather_code,"
-            "temperature_2m_max,"
-            "temperature_2m_min,"
-            "apparent_temperature_max,"
-            "apparent_temperature_min,"
-            "sunrise,"
-            "sunset,"
-            "daylight_duration,"
-            "sunshine_duration,"
-            "uv_index_max,"
-            "precipitation_sum,"
-            "precipitation_hours,"
-            "precipitation_probability_max,"
-            "wind_speed_10m_max,"
-            "wind_gusts_10m_max,"
-            "wind_direction_10m_dominant,"
-            "shortwave_radiation_sum,"
-            "et0_fao_evapotranspiration"
-        ),
-
-        "forecast_days": 7,
-    }
-
-    response = requests.get(
-        WEATHER_API_URL,
-        params=params,
-        timeout=30
-    )
-    response.raise_for_status()
-    return response.json()
-
-
 def main():
+    """Standalone execution: load .env, fetch all locations, print results."""
+    project_root = Path(__file__).resolve().parents[2]
+    load_dotenv(project_root / ".env")
+    api_url = os.getenv("WEATHER_API_URL", DEFAULT_API_URL)
+
     locations = load_locations()
     for loc in locations:
         print(f"Fetching weather for {loc['name']}...")
-        data = fetch_weather(loc["latitude"], loc["longitude"])
+        data, params = fetch_weather(loc["latitude"], loc["longitude"], api_url=api_url)
         print(data)
         print("-" * 40)
 

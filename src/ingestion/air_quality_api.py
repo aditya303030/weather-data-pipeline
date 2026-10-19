@@ -1,3 +1,8 @@
+"""Air Quality API client for the Open-Meteo Air Quality API.
+
+Exposes fetch_air_quality() for pipeline use and main() for standalone execution.
+Variable definitions are the verified production set (aligned with save_raw_data notebook).
+"""
 import os
 from pathlib import Path
 
@@ -5,99 +10,76 @@ import requests
 import yaml
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(PROJECT_ROOT / ".env")
+# ── Default API URL (public Open-Meteo endpoint) ──
+DEFAULT_API_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
-AIR_QUALITY_API_URL = os.getenv("AIR_QUALITY_API_URL")
-LOCATIONS_FILE = PROJECT_ROOT / "config" / "locations.yaml"
+# ── Air Quality API variables (verified — European AQI sub-indices NOT supported) ──
+AQ_CURRENT_VARS = ",".join([
+    "pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide",
+    "sulphur_dioxide", "ozone", "aerosol_optical_depth", "dust",
+    "uv_index", "uv_index_clear_sky", "ammonia",
+    "alder_pollen", "birch_pollen", "grass_pollen",
+    "mugwort_pollen", "olive_pollen", "ragweed_pollen",
+    "european_aqi", "us_aqi",
+    "us_aqi_pm2_5", "us_aqi_pm10", "us_aqi_ozone",
+    "us_aqi_nitrogen_dioxide", "us_aqi_sulphur_dioxide", "us_aqi_carbon_monoxide",
+])
+
+AQ_HOURLY_VARS = AQ_CURRENT_VARS  # Same variables available hourly
 
 
-def load_locations():
-    with open(LOCATIONS_FILE) as f:
-        config = yaml.safe_load(f)
-    return config["locations"]
+def fetch_air_quality(latitude, longitude, api_url=None):
+    """Fetch comprehensive air quality data for a single location.
 
+    Args:
+        latitude: Location latitude.
+        longitude: Location longitude.
+        api_url: Air Quality API endpoint. Falls back to DEFAULT_API_URL if not provided.
 
-def fetch_air_quality(latitude, longitude):
-    hourly_variables = [
-        "pm10",
-        "pm2_5",
-        "carbon_monoxide",
-        "carbon_dioxide",
-        "nitrogen_dioxide",
-        "sulphur_dioxide",
-        "ozone",
-        "aerosol_optical_depth",
-        "dust",
-        "uv_index",
-        "uv_index_clear_sky",
-        "ammonia",
-        "methane",
-        "formaldehyde",
-        "glyoxal",
-        "non_methane_volatile_organic_compounds",
-        "pm10_wildfires",
-        "peroxyacyl_nitrates",
-        "secondary_inorganic_aerosol",
-        "residential_elementary_carbon",
-        "total_elementary_carbon",
-        "pm2_5_total_organic_matter",
-        "sea_salt_aerosol",
-        "nitrogen_monoxide",
-        "european_aqi",
-        "european_aqi_pm2_5",
-        "european_aqi_pm10",
-        "european_aqi_nitrogen_dioxide",
-        "european_aqi_ozone",
-        "european_aqi_sulphur_dioxide",
-        "us_aqi",
-        "us_aqi_pm2_5",
-        "us_aqi_pm10",
-        "us_aqi_nitrogen_dioxide",
-        "us_aqi_carbon_monoxide",
-        "us_aqi_ozone",
-        "us_aqi_sulphur_dioxide",
-    ]
-
-    current_variables = [
-        "european_aqi",
-        "us_aqi",
-        "pm10",
-        "pm2_5",
-        "carbon_monoxide",
-        "nitrogen_dioxide",
-        "sulphur_dioxide",
-        "ozone",
-        "aerosol_optical_depth",
-        "dust",
-        "uv_index",
-        "uv_index_clear_sky",
-    ]
+    Returns:
+        Tuple of (data, params) where data is the raw API response dict
+        and params is the request parameters dict.
+    """
+    url = api_url or DEFAULT_API_URL
 
     params = {
         "latitude": latitude,
         "longitude": longitude,
-        "hourly": ",".join(hourly_variables),
-        "current": ",".join(current_variables),
-        "forecast_days": 7,
+        "current": AQ_CURRENT_VARS,
+        "hourly": AQ_HOURLY_VARS,
         "timezone": "UTC",
+        "forecast_days": 1,
     }
 
-    response = requests.get(
-        AIR_QUALITY_API_URL,
-        params=params,
-        timeout=30,
-    )
+    response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
+    data = response.json()
 
-    return response.json()
+    if not data or "latitude" not in data:
+        raise ValueError("Empty or malformed air quality response")
+
+    return data, params
+
+
+def load_locations():
+    """Load locations from config/locations.yaml for standalone use."""
+    project_root = Path(__file__).resolve().parents[2]
+    locations_file = project_root / "config" / "locations.yaml"
+    with open(locations_file) as f:
+        config = yaml.safe_load(f)
+    return config["locations"]
 
 
 def main():
+    """Standalone execution: load .env, fetch all locations, print results."""
+    project_root = Path(__file__).resolve().parents[2]
+    load_dotenv(project_root / ".env")
+    api_url = os.getenv("AIR_QUALITY_API_URL", DEFAULT_API_URL)
+
     locations = load_locations()
     for loc in locations:
         print(f"Fetching air quality for {loc['name']}...")
-        data = fetch_air_quality(loc["latitude"], loc["longitude"])
+        data, params = fetch_air_quality(loc["latitude"], loc["longitude"], api_url=api_url)
         print(data)
         print("-" * 40)
 
