@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 
 import requests
-import yaml
 from dotenv import load_dotenv
 
 # ── Default API URL (public Open-Meteo endpoint) ──
@@ -83,30 +82,24 @@ def fetch_weather(latitude, longitude, api_url=None):
 
 
 def load_locations(spark=None):
-    """Load weather ingestion locations.
+    """Load weather ingestion locations from the Delta registry.
 
-    Primary source: ``weather_api.reference.location_registry`` where
+    Reads from ``weather_api.reference.location_registry`` where
     ``is_active = true`` and ``weather_enabled = true``.
 
-    Falls back to ``config/locations.yaml`` when the registry is
-    unavailable (no Spark session, table missing, or empty).
+    Raises RuntimeError if the registry is unavailable or empty.
+    No YAML fallback — the registry is the sole source of truth.
     """
-    if spark is not None:
-        try:
-            from location_discovery import load_active_locations
-            locations = load_active_locations(spark, source="weather")
-            if locations:
-                return locations
-            print("⚠️  Registry returned 0 weather-enabled locations — falling back to YAML")
-        except Exception as e:
-            print(f"⚠️  Could not read from registry: {e} — falling back to YAML")
-
-    # Fallback: load from YAML
-    project_root = Path(__file__).resolve().parents[2]
-    locations_file = project_root / "config" / "locations.yaml"
-    with open(locations_file) as f:
-        config = yaml.safe_load(f)
-    return config["locations"]
+    if spark is None:
+        raise RuntimeError("Spark session required to read from the location registry")
+    from location_discovery import load_active_locations
+    locations = load_active_locations(spark, source="weather")
+    if not locations:
+        raise RuntimeError(
+            "No weather-enabled locations found in registry. "
+            "Run initialize_registry_geonames() first."
+        )
+    return locations
 
 
 def main():
@@ -115,17 +108,11 @@ def main():
     load_dotenv(project_root / ".env")
     api_url = os.getenv("WEATHER_API_URL", DEFAULT_API_URL)
 
-    # Try to get a Spark session for registry access; fall back to YAML
-    spark = None
-    try:
-        from pyspark.sql import SparkSession
-        spark = SparkSession.builder.getOrCreate()
-    except Exception:
-        pass
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
 
     locations = load_locations(spark=spark)
     for loc in locations:
-        print(f"Fetching weather for {loc['name']}...")
         data, params = fetch_weather(loc["latitude"], loc["longitude"], api_url=api_url)
         print(data)
         print("-" * 40)
