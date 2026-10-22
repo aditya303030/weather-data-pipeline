@@ -75,8 +75,8 @@ def fetch_weather(latitude, longitude, api_url=None):
     response.raise_for_status()
     data = response.json()
 
-    if not data or "latitude" not in data:
-        raise ValueError("Empty or malformed weather response")
+    from src.validation.ingestion import validate_response
+    validate_response("weather", data)
 
     return data, params
 
@@ -92,7 +92,7 @@ def load_locations(spark=None):
     """
     if spark is None:
         raise RuntimeError("Spark session required to read from the location registry")
-    from location_discovery import load_active_locations
+    from src.ingestion.location_discovery import load_active_locations
     locations = load_active_locations(spark, source="weather")
     if not locations:
         raise RuntimeError(

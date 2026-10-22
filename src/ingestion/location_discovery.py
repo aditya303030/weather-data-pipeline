@@ -107,7 +107,7 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
     * updated_at is refreshed on every update.
     * is_active, weather_enabled, air_quality_enabled are NOT reset on update.
     * Locations absent from input are NOT deleted.
-    * Duplicate location_id values in input are deduplicated (last wins).
+    * Duplicate location_id values in input are deduplicated (first wins).
     """
     from pyspark.sql.types import (
         StructType, StructField, StringType, DoubleType,
@@ -115,19 +115,16 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
     )
     from delta.tables import DeltaTable
 
-    if not locations:
-        logger.warning("No locations to merge — skipping")
-        return
+    from src.validation.location_registry import validate_merge_input
+    validate_merge_input(locations)
 
     create_registry_table(spark)
 
-    # Deduplicate input by location_id (or by name+coords for fallbacks)
+    # Stable IDs only; historical null IDs require explicit migration.
     seen: set = set()
     unique: list[dict[str, Any]] = []
     for loc in locations:
         key = loc.get("location_id")
-        if key is None:
-            key = ("__fallback__", loc["location_name"], loc["latitude"], loc["longitude"])
         if key not in seen:
             seen.add(key)
             unique.append(loc)
@@ -139,6 +136,9 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
     for loc in unique:
         normalized.append({
             "location_id": loc.get("location_id"),
+            "geonames_id": loc.get("geonames_id"),
+            "location_source": loc.get("location_source"),
+            "modification_date": loc.get("modification_date"),
             "location_name": loc["location_name"],
             "latitude": float(loc["latitude"]),
             "longitude": float(loc["longitude"]),
@@ -160,6 +160,9 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
 
     schema = StructType([
         StructField("location_id",          LongType(),     True),
+        StructField("geonames_id", LongType(), True),
+        StructField("location_source", StringType(), True),
+        StructField("modification_date", StringType(), True),
         StructField("location_name",        StringType(),   False),
         StructField("latitude",             DoubleType(),   False),
         StructField("longitude",            DoubleType(),   False),
@@ -182,20 +185,15 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
     source_df = spark.createDataFrame(normalized, schema=schema)
     target = DeltaTable.forName(spark, REGISTRY_TABLE)
 
-    # Merge: match on location_id, or on name+coords when location_id is NULL
-    merge_condition = (
-        "(t.location_id IS NOT NULL AND s.location_id IS NOT NULL "
-        "  AND t.location_id = s.location_id) "
-        "OR "
-        "(t.location_id IS NULL AND s.location_id IS NULL "
-        "  AND t.location_name = s.location_name "
-        "  AND t.latitude = s.latitude AND t.longitude = s.longitude)"
-    )
+    merge_condition = "t.location_id = s.location_id"
 
     (
         target.alias("t")
         .merge(source_df.alias("s"), merge_condition)
         .whenMatchedUpdate(set={
+            "geonames_id": "s.geonames_id",
+            "location_source": "s.location_source",
+            "modification_date": "s.modification_date",
             "location_name":  "s.location_name",
             "latitude":       "s.latitude",
             "longitude":      "s.longitude",
@@ -212,6 +210,9 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
         })
         .whenNotMatchedInsert(values={
             "location_id":          "s.location_id",
+            "geonames_id": "s.geonames_id",
+            "location_source": "s.location_source",
+            "modification_date": "s.modification_date",
             "location_name":        "s.location_name",
             "latitude":             "s.latitude",
             "longitude":            "s.longitude",
@@ -311,26 +312,23 @@ def enable_locations_for_ingestion(
     if not spark.catalog.tableExists(REGISTRY_TABLE):
         raise RuntimeError(f"Registry table {REGISTRY_TABLE} does not exist")
 
-    if location_ids is not None:
-        id_list = ",".join(str(i) for i in location_ids)
-        where_clause = f"location_id IN ({id_list})"
-    elif limit is not None:
+    from src.validation.location_registry import validate_activation_arguments
+    validate_activation_arguments(location_ids, limit, weather, air_quality, distributed)
+    if location_ids is None:
+        from pyspark.sql import functions as F
+        from pyspark.sql.window import Window
+        candidates = spark.table(REGISTRY_TABLE).filter("is_active = true")
         if distributed:
-            # Select one highest-population location per state, up to limit
-            where_clause = (
-                "location_id IN ("
-                "  SELECT location_id FROM ("
-                "    SELECT location_id, state, population,"
-                "      ROW_NUMBER() OVER (PARTITION BY state ORDER BY population DESC NULLS LAST) AS rn"
-                f"    FROM {REGISTRY_TABLE} WHERE is_active = true"
-                "  ) WHERE rn = 1"
-                f"  LIMIT {limit}"
-                ")"
-            )
-        else:
-            where_clause = f"is_active = true ORDER BY population DESC NULLS LAST LIMIT {limit}"
-    else:
-        raise ValueError("Either location_ids or limit must be provided")
+            candidates = candidates.withColumn("_rank", F.row_number().over(
+                Window.partitionBy("state_code").orderBy(F.col("population").desc_nulls_last(), F.col("location_id"))
+            )).filter("_rank = 1")
+        location_ids = [r.location_id for r in candidates.orderBy(
+            F.col("population").desc_nulls_last(), F.col("location_id")
+        ).limit(limit).select("location_id").collect()]
+    if not location_ids:
+        raise ValueError("No active locations available for activation")
+    id_list = ",".join(str(i) for i in sorted(set(location_ids)))
+    where_clause = f"location_id IN ({id_list})"
 
     set_clauses = []
     if weather:
@@ -392,6 +390,8 @@ def read_geonames_file(spark, file_path: str = GEONAMES_FILE_PATH):
     from pyspark.sql.types import (
         StructType, StructField, StringType, DoubleType, LongType, IntegerType,
     )
+    from src.validation.location_registry import validate_geonames_file
+    validate_geonames_file(spark, file_path)
     schema = StructType([
         StructField("geonameid",          LongType(),     True),
         StructField("name",               StringType(),   True),
@@ -436,26 +436,25 @@ def filter_populated_places(df):
     )
 
 
-def validate_geonames_locations(df):
+def filter_valid_geonames_locations(df):
     """Validate required fields and coordinate ranges.
 
     Each record must have a valid geonameid, non-empty name, valid
     coordinates, and US country code.
     """
-    from pyspark.sql.functions import col
-    return df.filter(
-        col("geonameid").isNotNull() & (col("geonameid") > 0)
-        & col("name").isNotNull() & (col("name") != "")
-        & col("latitude").isNotNull() & col("longitude").isNotNull()
-        & (col("latitude") >= -90.0) & (col("latitude") <= 90.0)
-        & (col("longitude") >= -180.0) & (col("longitude") <= 180.0)
-        & (col("country_code") == "US")
-    )
+    from src.validation.location_registry import valid_geonames_predicate
+    return df.filter(valid_geonames_predicate())
 
 
 def deduplicate_geonames_locations(df):
-    """Deduplicate by geonameid, keeping the first occurrence."""
-    return df.dropDuplicates(["geonameid"])
+    """Choose latest modification date, with a deterministic full-record tie break."""
+    from pyspark.sql import functions as F
+    from pyspark.sql.window import Window
+    order = Window.partitionBy("geonameid").orderBy(
+        F.col("modification_date").desc_nulls_last(),
+        F.to_json(F.struct(*[F.col(c) for c in sorted(df.columns)]))
+    )
+    return df.withColumn("_rank", F.row_number().over(order)).filter("_rank = 1").drop("_rank")
 
 
 def prepare_registry_records(df, spark):
@@ -505,7 +504,7 @@ def backup_registry(spark) -> str:
     if not spark.catalog.tableExists(REGISTRY_TABLE):
         logger.info("Registry table does not exist — no backup needed")
         return BACKUP_TABLE
-    backup_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     versioned_backup = f"{BACKUP_TABLE}_{backup_ts}"
     spark.sql(f"CREATE TABLE {versioned_backup} AS SELECT * FROM {REGISTRY_TABLE}")
     cnt = spark.sql(f"SELECT COUNT(*) AS cnt FROM {versioned_backup}").collect()[0]["cnt"]
@@ -523,25 +522,15 @@ def replace_registry(spark, new_df) -> int:
     4. Atomically replace the production table.
     5. Drop the staging table.
     """
-    # 1. Write staging table
-    logger.info("Writing staging table: %s", STAGING_TABLE)
+    from src.validation.location_registry import validate_registry
+    existing = spark.table(REGISTRY_TABLE) if spark.catalog.tableExists(REGISTRY_TABLE) else None
+    if existing is not None:
+        new_df = preserve_registry_settings(new_df, existing)
+    prepared_result = validate_registry(new_df, existing)
     new_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(STAGING_TABLE)
-    staging_cnt = spark.sql(f"SELECT COUNT(*) AS cnt FROM {STAGING_TABLE}").collect()[0]["cnt"]
-    logger.info("Staging table has %d rows", staging_cnt)
-
-    # 2. Validate staging
-    null_ids = spark.sql(
-        f"SELECT COUNT(*) AS cnt FROM {STAGING_TABLE} WHERE location_id IS NULL"
-    ).collect()[0]["cnt"]
-    if null_ids > 0:
-        raise ValueError(f"Staging table has {null_ids} null location_ids — aborting")
-    dup_cnt = spark.sql(
-        f"SELECT COUNT(*) AS cnt FROM ("
-        f"  SELECT location_id FROM {STAGING_TABLE} GROUP BY location_id HAVING COUNT(*) > 1"
-        f")"
-    ).collect()[0]["cnt"]
-    if dup_cnt > 0:
-        raise ValueError(f"Staging table has {dup_cnt} duplicate location_ids — aborting")
+    staged_result = validate_registry(spark.table(STAGING_TABLE), existing)
+    from src.validation.common import reconcile
+    reconcile(staged_result.checks["rows"], prepared_result.checks["rows"], "registry staging")
 
     # 3. Backup current registry
     backup_registry(spark)
@@ -554,6 +543,7 @@ def replace_registry(spark, new_df) -> int:
     spark.sql(f"DROP TABLE IF EXISTS {STAGING_TABLE}")
 
     final_cnt = spark.sql(f"SELECT COUNT(*) AS cnt FROM {REGISTRY_TABLE}").collect()[0]["cnt"]
+    reconcile(final_cnt, staged_result.checks["rows"], "registry publication")
     logger.info("Registry replaced: %d rows in %s", final_cnt, REGISTRY_TABLE)
     return final_cnt
 
@@ -574,6 +564,8 @@ def initialize_registry_geonames(
     # 1. Read source
     logger.info("Step 1/7: Reading GeoNames file: %s", file_path)
     raw_df = read_geonames_file(spark, file_path)
+    from src.validation.location_registry import validate_geonames_input
+    validate_geonames_input(raw_df)
     total_source = raw_df.count()
     logger.info("  Total rows in source: %d", total_source)
 
@@ -588,8 +580,15 @@ def initialize_registry_geonames(
 
     # 3. Validate
     logger.info("Step 3/7: Validating location records")
-    validated_df = validate_geonames_locations(filtered_df)
+    validated_df = filter_valid_geonames_locations(filtered_df)
     validated_cnt = validated_df.count()
+    # Retain rejected input for inspection; filtering is explicit and reconciled.
+    from pyspark.sql import functions as F
+    from src.validation.location_registry import valid_geonames_predicate
+    rejected_df = filtered_df.filter(~F.coalesce(valid_geonames_predicate(), F.lit(False)))
+    rejection_table = REGISTRY_TABLE + "_rejected_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    rejected_df.write.format("delta").saveAsTable(rejection_table)
+    logger.info("Rejected GeoNames records retained in %s", rejection_table)
     invalid_cnt = filtered_cnt - validated_cnt
     logger.info("  Valid: %d, Invalid: %d", validated_cnt, invalid_cnt)
 
@@ -610,7 +609,9 @@ def initialize_registry_geonames(
 
     # 7. Validate final
     logger.info("Step 7/7: Validating final registry")
-    final_stats = _validate_final_registry(spark)
+    from src.validation.location_registry import validate_registry, validate_registry_counts
+    validate_registry(spark.table(REGISTRY_TABLE))
+    final_stats = {}
 
     stats = {
         "source_total": total_source,
@@ -624,42 +625,17 @@ def initialize_registry_geonames(
         "final_registry_count": final_cnt,
         **final_stats,
     }
+    validate_registry_counts(stats)
     logger.info("=== GeoNames Registry Initialization Complete: %d locations ===", final_cnt)
     return stats
 
 
-def _validate_final_registry(spark) -> dict:
-    """Validate the final registry table after replacement."""
-    stats = {}
-    stats["total"] = spark.sql(
-        f"SELECT COUNT(*) AS cnt FROM {REGISTRY_TABLE}"
-    ).collect()[0]["cnt"]
-    stats["unique_location_ids"] = spark.sql(
-        f"SELECT COUNT(DISTINCT location_id) AS cnt FROM {REGISTRY_TABLE}"
-    ).collect()[0]["cnt"]
-    stats["unique_geonames_ids"] = spark.sql(
-        f"SELECT COUNT(DISTINCT geonames_id) AS cnt FROM {REGISTRY_TABLE}"
-    ).collect()[0]["cnt"]
-    stats["null_location_ids"] = spark.sql(
-        f"SELECT COUNT(*) AS cnt FROM {REGISTRY_TABLE} WHERE location_id IS NULL"
-    ).collect()[0]["cnt"]
-    stats["invalid_coords"] = spark.sql(
-        f"SELECT COUNT(*) AS cnt FROM {REGISTRY_TABLE} "
-        f"WHERE latitude IS NULL OR longitude IS NULL "
-        f"OR latitude < -90 OR latitude > 90 "
-        f"OR longitude < -180 OR longitude > 180"
-    ).collect()[0]["cnt"]
-    stats["non_us"] = spark.sql(
-        f"SELECT COUNT(*) AS cnt FROM {REGISTRY_TABLE} WHERE country_code != 'US'"
-    ).collect()[0]["cnt"]
-    stats["states"] = spark.sql(
-        f"SELECT COUNT(DISTINCT state) AS cnt FROM {REGISTRY_TABLE} WHERE state IS NOT NULL"
-    ).collect()[0]["cnt"]
-    stats["inactive_count"] = spark.sql(
-        f"SELECT COUNT(*) AS cnt FROM {REGISTRY_TABLE} WHERE is_active = false"
-    ).collect()[0]["cnt"]
-    logger.info(
-        "Registry validation: %d locations, %d states, %d null IDs, %d invalid coords",
-        stats["total"], stats["states"], stats["null_location_ids"], stats["invalid_coords"],
-    )
-    return stats
+def preserve_registry_settings(new_df, existing):
+    """Refresh metadata while preserving settings and creation time for known IDs."""
+    from pyspark.sql import functions as F
+    settings = ("is_active", "weather_enabled", "air_quality_enabled", "created_at")
+    joined = new_df.alias("n").join(existing.alias("o"), "location_id", "left")
+    return joined.select(*[
+        (F.when(F.col("o.location_id").isNotNull(), F.col("o."+c)).otherwise(F.col("n."+c)).alias(c)
+         if c in settings else F.col("n."+c).alias(c)) for c in new_df.columns
+    ])

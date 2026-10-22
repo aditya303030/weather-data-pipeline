@@ -29,8 +29,8 @@ def fetch_earthquakes(api_url=None):
     response.raise_for_status()
     data = response.json()
 
-    if not data or "features" not in data:
-        raise ValueError("Empty or malformed earthquake GeoJSON response")
+    from src.validation.ingestion import validate_response
+    validate_response("earthquakes", data)
 
     return data, {}
 
