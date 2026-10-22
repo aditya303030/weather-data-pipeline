@@ -1,5 +1,5 @@
 """Earthquake keys, precision, latest-version and persisted-scope checks."""
-from .common import check_frame, require, reconcile, scoped_target
+from .common import check_frame, require, reconcile, scoped_target, ValidationResult
 
 def validate_earthquakes(df,kind,context=None):
     from pyspark.sql import functions as F
@@ -26,6 +26,7 @@ def validate_earthquake_target(source,target,kind):
     require(scope.count()==source.count(),'Missing latest events')
     pairs=source.alias('s').join(target.alias('t'),'event_id')
     require(not pairs.filter((F.col('t.updated_at')<F.col('s.updated_at')) | ((F.col('t.updated_at')==F.col('s.updated_at')) & (F.col('t.snapshot_at')<F.col('s.snapshot_at')))).limit(1).count(),'Older event replaced newer version')
+    return ValidationResult('earthquake_target',{'latest_version_order':True})
 
 
 def source_context(bronze,history):

@@ -17,6 +17,8 @@ class SparkBoundaryTests(unittest.TestCase):
     def setUpClass(cls):
         from pyspark.sql import SparkSession
         cls.spark=SparkSession.builder.master('local[1]').appName('offline-pipeline-tests').config('spark.ui.enabled','false').getOrCreate()
+        if not cls.spark.sparkContext.master.startswith('local'):
+            raise unittest.SkipTest('Offline tests require a local Spark context')
         cls.spark.conf.set('spark.sql.session.timeZone','UTC')
     @classmethod
     def tearDownClass(cls):cls.spark.stop()
@@ -51,7 +53,8 @@ class SparkBoundaryTests(unittest.TestCase):
         data=wrapper();data.update(_source_file_path='/x',_rescued_data=None,_ingest_timestamp='2026-10-21T00:00:00Z')
         data['raw_response']['elevation']=10.;data['raw_response']['current']['interval']=900
         from pyspark.sql import functions as F
-        bronze=self.spark.read.json(self.spark.sparkContext.parallelize([json.dumps(data)])).withColumn('_ingest_timestamp',F.to_timestamp('_ingest_timestamp'))
+        from src.transformations.schemas import envelope_schema
+        bronze=self.spark.read.schema(envelope_schema('weather')).json(self.spark.sparkContext.parallelize([json.dumps(data)])).withColumn('_ingest_timestamp',F.to_timestamp(F.lit('2026-10-21T00:00:00Z'))).withColumn('_source_file_path',F.lit('/x'))
         outputs=transform(self.spark,bronze)
         for df in outputs.values():self.assertEqual(df.select('location_id').first()[0],1)
     def test_empty_earthquake_feed_and_millisecond_precision(self):
@@ -67,5 +70,6 @@ class SparkBoundaryTests(unittest.TestCase):
         outputs=transform(self.spark,frame(data))
         validate_earthquakes(outputs['latest'],'latest');self.assertEqual(outputs['latest'].count(),0)
         data['raw_response']['features']=[{'id':'event','type':'Feature','properties':{'time':1792540800123,'updated':1792540800456,'mag':1.0},'geometry':{'type':'Point','coordinates':[-90.,40.,10.]}}]
+        data['raw_response']['metadata']['count']=1
         row=transform(self.spark,frame(data))['latest'].first()
         self.assertEqual(row.event_time.microsecond,123000);self.assertEqual(row.updated_at.microsecond,456000)

@@ -103,4 +103,6 @@ def transform(spark, input_df):
         .drop("_rn")
     )
 
-    return {'latest':silver_eq_latest,'history':silver_eq}
+    from src.contracts import output_types
+    from src.validation.common import normalize_output
+    return {'latest':normalize_output(silver_eq_latest,output_types('earthquakes','latest')),'history':normalize_output(silver_eq,output_types('earthquakes','history'))}

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from typing import Any
+from src.config import load_config, SOURCES
 
 # ── Logging ──
 logger = logging.getLogger(__name__)
@@ -22,8 +23,6 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ── Delta table constants ──
-REGISTRY_SCHEMA = "weather_api.reference"
-REGISTRY_TABLE = "weather_api.reference.location_registry"
 
 # ── US state name → postal-code mapping ──
 US_STATE_CODES: dict[str, str] = {
@@ -55,8 +54,11 @@ US_CODE_TO_STATE: dict[str, str] = {v: k for k, v in US_STATE_CODES.items()}
 #  REGISTRY MANAGEMENT  (requires a Spark session)
 # ═════════════════════════════════════════════════════════════════════
 
-def create_registry_table(spark) -> None:
+def create_registry_table(spark, config=None) -> None:
     """Create the weather_api.reference schema and location_registry Delta table."""
+    cfg = (config or load_config()).validate()
+    REGISTRY_TABLE = cfg.registry
+    REGISTRY_SCHEMA = f"{cfg.catalog}.{cfg.reference_schema}"
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {REGISTRY_SCHEMA}")
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {REGISTRY_TABLE} (
@@ -97,7 +99,7 @@ def create_registry_table(spark) -> None:
     logger.info("Registry table ensured: %s", REGISTRY_TABLE)
 
 
-def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
+def merge_locations(spark, locations: list[dict[str, Any]], config=None) -> None:
     """Idempotently MERGE location records into the Delta registry.
 
     Rules:
@@ -109,6 +111,8 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
     * Locations absent from input are NOT deleted.
     * Duplicate location_id values in input are deduplicated (first wins).
     """
+    cfg = (config or load_config()).validate()
+    REGISTRY_TABLE = cfg.registry
     from pyspark.sql.types import (
         StructType, StructField, StringType, DoubleType,
         BooleanType, TimestampType, LongType,
@@ -118,7 +122,7 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
     from src.validation.location_registry import validate_merge_input
     validate_merge_input(locations)
 
-    create_registry_table(spark)
+    create_registry_table(spark, config=cfg)
 
     # Stable IDs only; historical null IDs require explicit migration.
     seen: set = set()
@@ -183,6 +187,8 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
     ])
 
     source_df = spark.createDataFrame(normalized, schema=schema)
+    from src.validation.location_registry import validate_registry
+    validate_registry(source_df)
     target = DeltaTable.forName(spark, REGISTRY_TABLE)
 
     merge_condition = "t.location_id = s.location_id"
@@ -238,7 +244,7 @@ def merge_locations(spark, locations: list[dict[str, Any]]) -> None:
     logger.info("Registry merge complete. Total records: %d", total)
 
 
-def load_active_locations(spark, source: str = "all") -> list[dict[str, Any]]:
+def load_active_locations(spark, source: str = "all", config=None) -> list[dict[str, Any]]:
     """Load active locations from the registry for ingestion.
 
     Args:
@@ -250,6 +256,10 @@ def load_active_locations(spark, source: str = "all") -> list[dict[str, Any]]:
         state, state_code, country, country_code, timezone.
         Returns [] if the table does not exist.
     """
+    cfg = (config or load_config()).validate()
+    REGISTRY_TABLE = cfg.registry
+    from src.validation.common import require
+    require(source in (*SOURCES, "all"), "Unsupported registry source", stage="registry")
     if not spark.catalog.tableExists(REGISTRY_TABLE):
         logger.error("Registry table %s does not exist — run init_registry first", REGISTRY_TABLE)
         return []
@@ -260,7 +270,10 @@ def load_active_locations(spark, source: str = "all") -> list[dict[str, Any]]:
     elif source == "air_quality":
         query += " AND air_quality_enabled = true"
 
-    rows = spark.sql(query).collect()
+    frame = spark.sql(query)
+    from src.validation.location_registry import validate_registry
+    validate_registry(frame)
+    rows = frame.collect()
     locations = []
     for row in rows:
         rd = row.asDict()
@@ -289,6 +302,7 @@ def enable_locations_for_ingestion(
     weather: bool = True,
     air_quality: bool = True,
     distributed: bool = False,
+    config=None,
 ) -> dict:
     """Enable specific locations for weather and/or air-quality ingestion.
 
@@ -309,6 +323,8 @@ def enable_locations_for_ingestion(
     Returns:
         Dict with counts of enabled locations.
     """
+    cfg = (config or load_config()).validate()
+    REGISTRY_TABLE = cfg.registry
     if not spark.catalog.tableExists(REGISTRY_TABLE):
         raise RuntimeError(f"Registry table {REGISTRY_TABLE} does not exist")
 
@@ -325,8 +341,8 @@ def enable_locations_for_ingestion(
         location_ids = [r.location_id for r in candidates.orderBy(
             F.col("population").desc_nulls_last(), F.col("location_id")
         ).limit(limit).select("location_id").collect()]
-    if not location_ids:
-        raise ValueError("No active locations available for activation")
+    from src.validation.location_registry import validate_activation_selection
+    validate_activation_selection(spark.table(REGISTRY_TABLE), location_ids)
     id_list = ",".join(str(i) for i in sorted(set(location_ids)))
     where_clause = f"location_id IN ({id_list})"
 
@@ -369,9 +385,6 @@ def enable_locations_for_ingestion(
 # GeoNames is the sole source for the location registry.  No external
 # geocoding API calls are made during registry initialization.
 
-GEONAMES_FILE_PATH = "/Volumes/weather_api/reference/location_files/US.txt"
-STAGING_TABLE = "weather_api.reference.location_registry_staging"
-BACKUP_TABLE = "weather_api.reference.location_registry_backup"
 
 # GeoNames feature codes to EXCLUDE from the registry.
 #   PPLQ  – abandoned populated place
@@ -382,11 +395,13 @@ BACKUP_TABLE = "weather_api.reference.location_registry_backup"
 EXCLUDED_FEATURE_CODES = frozenset(["PPLQ", "PPLH", "PPLW", "PPLCH", "STLMT"])
 
 
-def read_geonames_file(spark, file_path: str = GEONAMES_FILE_PATH):
+def read_geonames_file(spark, file_path=None, config=None):
     """Read the GeoNames US.txt tab-separated file as a PySpark DataFrame.
 
     Uses the official 19-column GeoNames layout with explicit data types.
     """
+    cfg = (config or load_config()).validate()
+    file_path = file_path or cfg.registry_source
     from pyspark.sql.types import (
         StructType, StructField, StringType, DoubleType, LongType, IntegerType,
     )
@@ -494,13 +509,16 @@ def prepare_registry_records(df, spark):
     )
 
 
-def backup_registry(spark) -> str:
+def backup_registry(spark, config=None) -> str:
     """Create a versioned backup of the current location registry.
 
     Uses a timestamped backup table name to avoid overwriting previous backups.
     Returns the backup table name.  If the registry does not exist,
     returns a name without creating a table.
     """
+    cfg = (config or load_config()).validate()
+    REGISTRY_TABLE = cfg.registry
+    BACKUP_TABLE = cfg.table(cfg.reference_schema, cfg.registry_backup_prefix)
     if not spark.catalog.tableExists(REGISTRY_TABLE):
         logger.info("Registry table does not exist — no backup needed")
         return BACKUP_TABLE
@@ -512,7 +530,7 @@ def backup_registry(spark) -> str:
     return versioned_backup
 
 
-def replace_registry(spark, new_df) -> int:
+def replace_registry(spark, new_df, config=None) -> int:
     """Replace the location registry with new GeoNames-derived data.
 
     Safe staging-and-validation approach:
@@ -522,9 +540,13 @@ def replace_registry(spark, new_df) -> int:
     4. Atomically replace the production table.
     5. Drop the staging table.
     """
+    cfg = (config or load_config()).validate()
+    REGISTRY_TABLE = cfg.registry
+    STAGING_TABLE = cfg.registry_staging
     from src.validation.location_registry import validate_registry
     existing = spark.table(REGISTRY_TABLE) if spark.catalog.tableExists(REGISTRY_TABLE) else None
     if existing is not None:
+        validate_registry(existing)
         new_df = preserve_registry_settings(new_df, existing)
     prepared_result = validate_registry(new_df, existing)
     new_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(STAGING_TABLE)
@@ -533,7 +555,7 @@ def replace_registry(spark, new_df) -> int:
     reconcile(staged_result.checks["rows"], prepared_result.checks["rows"], "registry staging")
 
     # 3. Backup current registry
-    backup_registry(spark)
+    backup_registry(spark, config=cfg)
 
     # 4. Atomically replace production table
     logger.info("Replacing production registry: %s", REGISTRY_TABLE)
@@ -550,7 +572,8 @@ def replace_registry(spark, new_df) -> int:
 
 def initialize_registry_geonames(
     spark,
-    file_path: str = GEONAMES_FILE_PATH,
+    file_path=None,
+    config=None,
 ) -> dict:
     """Full GeoNames-based registry initialization.
 
@@ -559,11 +582,13 @@ def initialize_registry_geonames(
 
     Returns a dict with import statistics.
     """
+    cfg = (config or load_config()).validate()
+    REGISTRY_TABLE = cfg.registry
     logger.info("=== GeoNames Registry Initialization ===")
 
     # 1. Read source
     logger.info("Step 1/7: Reading GeoNames file: %s", file_path)
-    raw_df = read_geonames_file(spark, file_path)
+    raw_df = read_geonames_file(spark, file_path, config=cfg)
     from src.validation.location_registry import validate_geonames_input
     validate_geonames_input(raw_df)
     total_source = raw_df.count()
@@ -586,7 +611,7 @@ def initialize_registry_geonames(
     from pyspark.sql import functions as F
     from src.validation.location_registry import valid_geonames_predicate
     rejected_df = filtered_df.filter(~F.coalesce(valid_geonames_predicate(), F.lit(False)))
-    rejection_table = REGISTRY_TABLE + "_rejected_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    rejection_table = cfg.table(cfg.reference_schema, cfg.registry_rejected_prefix) + "_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     rejected_df.write.format("delta").saveAsTable(rejection_table)
     logger.info("Rejected GeoNames records retained in %s", rejection_table)
     invalid_cnt = filtered_cnt - validated_cnt
@@ -605,7 +630,7 @@ def initialize_registry_geonames(
 
     # 6. Backup and replace
     logger.info("Step 6/7: Backing up and replacing registry")
-    final_cnt = replace_registry(spark, registry_df)
+    final_cnt = replace_registry(spark, registry_df, config=cfg)
 
     # 7. Validate final
     logger.info("Step 7/7: Validating final registry")
@@ -639,3 +664,26 @@ def preserve_registry_settings(new_df, existing):
         (F.when(F.col("o.location_id").isNotNull(), F.col("o."+c)).otherwise(F.col("n."+c)).alias(c)
          if c in settings else F.col("n."+c).alias(c)) for c in new_df.columns
     ])
+
+def select_ingestion_locations(spark,source,limit,slot,config=None):
+    """Validate active registry before HTTP; collect only the deterministic request block."""
+    from pyspark.sql import functions as F
+    from pyspark.sql.window import Window
+    from src.validation.common import require
+    from src.validation.location_registry import validate_registry, validate_selection_input
+    cfg=(config or load_config()).validate()
+    require(source in ('weather','air_quality'),'Unsupported location source',stage='registry')
+    validate_selection_input([],limit,slot)
+    require(limit<=cfg.max_manifest_files,"Selection exceeds configured manifest bound",stage="registry")
+    active=spark.table(cfg.registry).filter(F.col('is_active')==True)
+    # Validate active candidates, including all activation flags, before source selection.
+    validate_registry(active)
+    enabled=active.filter(F.col(source+'_enabled')==True)
+    count=enabled.count()
+    require(count>0,'No enabled locations for '+source,stage='registry')
+    start=(slot%((count+limit-1)//limit))*limit
+    selected=enabled.withColumn('_position',F.row_number().over(Window.orderBy('location_id'))).filter((F.col('_position')>start)&(F.col('_position')<=start+limit))
+    rows=selected.select('location_id',F.col('location_name').alias('name'),'latitude','longitude').collect()
+    locations=[r.asDict() for r in rows]
+    validate_selection_input(locations,limit,slot)
+    return locations

@@ -1,0 +1,21 @@
+{
+  "catalog": "weather_api_test",
+  "reference_schema": "reference",
+  "raw_schema": "raw",
+  "bronze_schema": "bronze",
+  "silver_schema": "silver",
+  "state_schema": "pipeline_state",
+  "registry_name": "location_registry",
+  "registry_staging_name": "location_registry_staging",
+  "registry_backup_prefix": "location_registry_backup",
+  "registry_rejected_prefix": "location_registry_rejected",
+  "ledger_name": "silver_completed_files",
+  "registry_source": "/Volumes/weather_api_test/reference/location_files/US.txt",
+  "raw_root": "/Volumes/weather_api_test/raw/raw_files",
+  "staging_root": "/Volumes/weather_api_test/raw/raw_files/_staging",
+  "manifest_root": "/Volumes/weather_api_test/raw/raw_files/_runs",
+  "attempts_root": "/Volumes/weather_api_test/raw/raw_files/_attempts",
+  "schema_root": "/Volumes/weather_api_test/pipeline_state/autoloader_state/_schemas",
+  "checkpoint_root": "/Volumes/weather_api_test/pipeline_state/autoloader_state/_checkpoints",
+  "max_manifest_files": 1000
+}

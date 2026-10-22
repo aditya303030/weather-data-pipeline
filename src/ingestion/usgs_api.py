@@ -4,10 +4,8 @@ Exposes fetch_earthquakes() for pipeline use and main() for standalone execution
 """
 import json
 import os
-from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
 
 # ── Default API URL (public USGS all_day feed) ──
 DEFAULT_API_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson"
@@ -36,9 +34,7 @@ def fetch_earthquakes(api_url=None):
 
 
 def main():
-    """Standalone execution: load .env, fetch feed, print results."""
-    project_root = Path(__file__).resolve().parents[2]
-    load_dotenv(project_root / ".env")
+    """Standalone execution: use process environment, fetch feed, print results."""
     api_url = os.getenv("USGS_API_URL", DEFAULT_API_URL)
 
     print("Fetching earthquake data from USGS...")
@@ -51,4 +47,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from src.ingestion.diagnostics import run_diagnostic
+    run_diagnostic(main)

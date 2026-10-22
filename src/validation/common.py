@@ -4,22 +4,41 @@ import json
 import math
 from datetime import datetime
 
+@dataclass
+class CheckResult:
+    stage: str
+    check: str
+    severity: str = 'error'
+    passed: bool = True
+    affected_rows: int | None = None
+    details: dict = field(default_factory=dict)
+    context: dict = field(default_factory=dict)
+
 class ValidationError(ValueError):
-    pass
+    def __init__(self, message, result=None):
+        self.result = result or CheckResult('validation', 'requirement', passed=False, details={'message':message})
+        super().__init__(json.dumps(asdict(self.result), default=str, sort_keys=True))
 
 @dataclass
 class ValidationResult:
     stage: str
     checks: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
+    context: dict = field(default_factory=dict)
+
+    def to_dict(self):
+        records=[asdict(CheckResult(self.stage, name, affected_rows=(value if type(value) is int and name.startswith(('key:','range:','timestamp:','duplicate')) else None), details={'value':value}, context=self.context)) for name,value in self.checks.items()]
+        records += [asdict(CheckResult(self.stage, 'warning', severity='warning', passed=False, details={'message':w}, context=self.context)) for w in self.warnings]
+        return {'stage':self.stage, 'results':records, 'context':self.context}
 
     def report(self):
-        print(json.dumps(asdict(self), default=str, sort_keys=True))
+        print(json.dumps(self.to_dict(), default=str, sort_keys=True))
         return self
 
-def require(condition, message):
+def require(condition, message, *, stage='validation', check='requirement', affected_rows=None, context=None):
     if not condition:
-        raise ValidationError(message)
+        raise ValidationError(message, CheckResult(stage,check,passed=False,affected_rows=affected_rows,details={'message':message},context=context or {}))
+
 
 def timestamp(value, *, offset_required=False):
     require(isinstance(value, str) and bool(value.strip()), 'Missing timestamp')
@@ -81,11 +100,11 @@ def check_frame(df, *, stage, keys, required=None, ranges=None, timestamps=(), n
     stats = df.agg(*exprs).first().asDict()
     require(not nonempty or stats['rows'] > 0, stage + ': empty output is forbidden')
     failures = {name: stats['c'+str(i)] for i,name in enumerate(conditions) if stats['c'+str(i)]}
-    require(not failures, f'{stage}: invalid records: {failures}')
+    require(not failures, f'{stage}: invalid records: {failures}',stage=stage,check='record_quality',affected_rows=sum(failures.values()))
     if keys:
-        duplicates = df.groupBy(*keys).count().filter(F.col('count') > 1).limit(1).count()
-        require(not duplicates, stage + ': duplicate source keys ' + str(keys))
-    return ValidationResult(stage, {'rows': stats['rows'], 'keys': keys}).report()
+        duplicates = df.groupBy(*keys).count().filter(F.col('count') > 1).agg(F.sum('count').alias('affected')).first().affected or 0
+        require(not duplicates, stage + ': duplicate source keys ' + str(keys),stage=stage,check='duplicate_keys',affected_rows=duplicates)
+    return ValidationResult(stage, {'rows': stats['rows'], 'keys': keys, **{name:stats['c'+str(i)] or 0 for i,name in enumerate(conditions)}})
 
 def compatible_target(source, target):
     """Fail before writes rather than dropping/recreating an existing table."""
@@ -102,4 +121,26 @@ def scoped_target(source, target, keys):
     require_columns(target, {k:None for k in source.columns})
     # Reconcile complete content, including nullable measurements, not only counts.
     require(not source.select(*source.columns).exceptAll(actual.select(*source.columns)).limit(1).count(), 'Target content differs within processing scope')
-    return ValidationResult('target_reconciliation', {'matched': True}).report()
+    return ValidationResult('target_reconciliation', {'matched': True})
+
+def normalize_output(df, types):
+    """Explicit output types. Invalid non-null casts block before writes, in one scan."""
+    from pyspark.sql import functions as F
+    require(set(df.columns)==set(types),'Transform columns differ from output contract',stage='silver',check='output_contract')
+    casted={n:F.expr(f'try_cast(`{n}` as {typ})') for n,typ in types.items()}
+    invalid={n:F.col(n).isNotNull() & c.isNull() for n,c in casted.items()}
+    # Integer/boolean domain checks prevent truncation/coercion of malformed values.
+    for n,typ in types.items():
+        if typ in ('int','long','boolean'):
+            raw=F.col(n).cast('double')
+            invalid[n]=invalid[n] | (F.col(n).isNotNull() & (raw != (casted[n].cast('int') if typ=='boolean' else casted[n]).cast('double')))
+    row=df.agg(*[F.sum(F.when(p,1).otherwise(0)).alias(n) for n,p in invalid.items()]).first().asDict()
+    failures={n:v for n,v in row.items() if v}
+    require(not failures,'Invalid casts: '+str(failures),stage='silver',check='casts',affected_rows=sum(failures.values()))
+    return df.select(*[c.alias(n) for n,c in casted.items()])
+
+# Context is attached at orchestration boundaries without repeating it in every
+# primitive check. Nested calls retain run/source diagnostics on raised failures.
+def contextualize(error, **context):
+    error.result.context.update(context)
+    return ValidationError(error.result.details.get('message','Validation failed'),error.result)

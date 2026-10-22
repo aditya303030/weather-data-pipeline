@@ -12,7 +12,7 @@ def validate_activation_arguments(location_ids,limit,weather,air_quality,distrib
 
 def validate_geonames_input(df):
     require_columns(df,{n:None for n in ('geonameid','name','latitude','longitude','country_code','feature_class','feature_code')})
-    return ValidationResult('geonames_structure',{'valid':True}).report()
+    return ValidationResult('geonames_structure',{'valid':True})
 
 def validate_registry(df, existing=None):
     from pyspark.sql import functions as F
@@ -37,7 +37,7 @@ def validate_registry_counts(stats):
     reconcile(stats['after_validation']-stats['duplicates_removed'],stats['after_dedup'],'dedup')
     reconcile(stats['after_dedup'],stats['final_registry_count'],'publication')
     require(stats['source_total']>=stats['class_p_total'],'Invalid input reconciliation')
-    return ValidationResult('registry_counts',stats).report()
+    return ValidationResult('registry_counts',stats)
 
 def valid_geonames_predicate():
     from pyspark.sql import functions as F
@@ -61,4 +61,38 @@ def validate_geonames_file(spark,file_path):
     row=source.agg(F.count('*').alias('rows'),F.sum(F.when(F.size(F.split('value','\t',-1))!=19,1).otherwise(0)).alias('malformed')).first()
     require(row.rows>0,'Empty GeoNames source')
     require(not row.malformed,'GeoNames input must contain exactly 19 tab-separated fields per row')
-    return ValidationResult('geonames_file',{'rows':row.rows}).report()
+    return ValidationResult('geonames_file',{'rows':row.rows})
+
+def validate_selection_input(locations,limit,slot):
+    from .common import numeric
+    require(type(limit) is int and limit>0 and type(slot) is int and slot>=0,'Positive limit and nonnegative slot required',stage='registry',check='selection_arguments')
+    ids=[]
+    for loc in locations:
+        require(isinstance(loc,dict) and type(loc.get('location_id')) is int and loc['location_id']>0,'Invalid stable selection ID',stage='registry')
+        require(isinstance(loc.get('name'),str) and bool(loc['name'].strip()),'Missing selection name',stage='registry')
+        numeric(loc.get('latitude'),-90,90,nullable=False);numeric(loc.get('longitude'),-180,180,nullable=False)
+        ids.append(loc['location_id'])
+    require(len(ids)==len(set(ids)),'Duplicate selection identities',stage='registry')
+
+def validate_activation_selection(registry,ids):
+    from pyspark.sql import functions as F
+    require(bool(ids),'No active IDs selected',stage='registry')
+    requested=registry.sparkSession.createDataFrame([(i,) for i in sorted(set(ids))], 'location_id long')
+    matches=requested.join(registry.select('location_id','is_active'),'location_id','left')
+    bad=matches.filter(F.col('is_active').isNull() | ~F.col('is_active')).limit(20).collect()
+    require(not bad,'Requested activation IDs are missing/inactive (sample): '+str([r.location_id for r in bad]),stage='registry',check='activation_membership')
+
+def validate_recovery_registry(spark,plan,config):
+    """Revalidate current registry for missing requests before an explicit HTTP resume."""
+    from pathlib import Path
+    pending=[e for e in plan['requests'] if e['source']!='earthquakes' and not Path(e['path']).exists()]
+    if not pending:return
+    require(spark is not None,'Spark registry validation required before fetching missing historical requests',stage='recovery')
+    from pyspark.sql import functions as F
+    for source in sorted({e['source'] for e in pending}):
+        entries=[e['location'] for e in pending if e['source']==source]
+        wanted=spark.createDataFrame([(e['location_id'],e['name'],e['latitude'],e['longitude']) for e in entries],'location_id long, _wanted_name string, _wanted_lat double, _wanted_lon double')
+        joined=wanted.join(spark.table(config.registry),'location_id','left')
+        validate_registry(joined.select(*spark.table(config.registry).columns))
+        mismatch=(~F.col('is_active').eqNullSafe(F.lit(True)) | ~F.col(source+'_enabled').eqNullSafe(F.lit(True)) | ~F.col('location_name').eqNullSafe(F.col('_wanted_name')) | ~F.col('latitude').eqNullSafe(F.col('_wanted_lat')) | ~F.col('longitude').eqNullSafe(F.col('_wanted_lon')))
+        require(not joined.filter(mismatch).limit(1).count(),'Recovery registry differs from saved request plan or is no longer enabled; review explicitly',stage='recovery',check='registry_membership',context={'source':source,'run_id':plan['run_id']})

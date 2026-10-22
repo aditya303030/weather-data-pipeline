@@ -1,3 +1,4 @@
+# Workspace target only: no jobs, resources, or schedules are defined here.
 # This is a Declarative Automation Bundle definition for weather-data-pipeline.
 # The Databricks extension requires databricks.yml configuration file.
 # See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.

@@ -1,3 +1,4 @@
+# LEGACY: not read by the current registry-driven pipeline. Retained for reference.
 coverage:
   mode: selected_locations
 

@@ -1,44 +1,54 @@
-"""Coordinate scoped transforms, validation, idempotent writes and completion."""
+"""Exact committed run → validate → all-target preflight → writes → reconcile → state."""
 from importlib import import_module
-from .incremental import pending_files, read_scope, merge_output, complete_files, ensure_state
+from src.config import load_config, SILVER_TABLES
+from src.validation.raw import load_committed
 from src.validation.bronze import validate_bronze
-from src.validation.common import require, ValidationResult
+from src.validation.common import ValidationResult, ValidationError, contextualize, require
+from .incremental import pending_files, read_scope, merge_output, complete_files, preflight_outputs
 
-TABLES={'weather':{'current':'weather_current','hourly':'weather_hourly','daily':'weather_daily'},'air_quality':{'current':'air_quality_current','hourly':'air_quality_hourly'},'earthquakes':{'latest':'earthquakes','history':'earthquakes_event_history'}}
+TABLES=SILVER_TABLES
 
-def run_silver(spark,source,paths=None,*,commit=True):
-    require(source in TABLES,'Unknown Silver source')
+def run_silver(spark,source,manifest_path,config=None,*,mark_completed=True,validate_only=False,report=True,require_targets=False):
+    cfg=(config or load_config()).validate()
+    manifest=load_committed(manifest_path,cfg,source)
     spark.conf.set('spark.sql.session.timeZone','UTC')
-    spark.sql('CREATE SCHEMA IF NOT EXISTS weather_api.silver')
-    table=f'weather_api.bronze.{source}_raw'
-    if paths is not None and commit: ensure_state(spark)
-    scope=pending_files(spark,table,source) if paths is None else paths
-    if not scope:
-        return ValidationResult('silver:'+source,{'pending_files':0}).report()
-    bronze=read_scope(spark,table,scope)
+    bronze=read_scope(spark,cfg.bronze(source),manifest,source)
     outputs={}
     try:
-        validate_bronze(bronze,source,scope)
+        # Always verify committed Bronze scope, even when ledger already records it.
+        validate_bronze(bronze,source,manifest,cfg)
         outputs=import_module('src.transformations.'+source).transform(spark,bronze)
         outputs={k:v.cache() for k,v in outputs.items()}
         validators=import_module('src.validation.'+source+'_silver')
+        context=validators.source_context(bronze,outputs['history']) if source=='earthquakes' else validators.source_context(bronze)
         if source=='earthquakes':
-            context=validators.source_context(bronze,outputs['history'])
-            for kind,df in outputs.items(): validators.validate_earthquakes(df,kind,context)
+            for kind,df in outputs.items():validators.validate_earthquakes(df,kind,context)
             validators.validate_latest_selection(outputs['history'],outputs['latest'])
         else:
-            context=validators.source_context(bronze)
-            for kind,df in outputs.items():
-                getattr(validators,'validate_'+source)(df,kind,context=context)
-        # Every source output passes before the first table is written.
+            for kind,df in outputs.items():getattr(validators,'validate_'+source)(df,kind,context=context)
+        keys={k:((['event_id'] if k=='latest' else ['event_id','snapshot_at']) if source=='earthquakes' else validators.KEYS[k]) for k in outputs}
+        targets={k:cfg.silver(source,k) for k in outputs}
+        if require_targets:
+            require(all(spark.catalog.tableExists(t) for t in targets.values()),'Missing required persisted Silver outputs',stage='target',check='target_existence')
+        preflight_outputs(spark,outputs,targets,keys)
+        pending=pending_files(spark,manifest,source,cfg)
+        has_pending=bool(pending.limit(1).count())
+        if not validate_only and has_pending:
+            spark.sql(f'CREATE SCHEMA IF NOT EXISTS {cfg.catalog}.{cfg.silver_schema}')
+            # Replay the entire immutable scope after partial failure, not a moving backlog.
+            for kind,df in outputs.items():merge_output(spark,df,targets[kind],keys[kind],latest=(source=='earthquakes' and kind=='latest'))
+        # validate_only checks persisted targets when present; source validation/preflight
+        # still works before first publication without creating any schemas or tables.
         for kind,df in outputs.items():
-            keys=(['event_id'] if kind=='latest' else ['event_id','snapshot_at']) if source=='earthquakes' else validators.KEYS[kind]
-            target='weather_api.silver.'+TABLES[source][kind]
-            merge_output(spark,df,target,keys,latest=(source=='earthquakes' and kind=='latest'))
-            if source=='earthquakes': validators.validate_earthquake_target(df,spark.table(target),kind)
-            else: getattr(validators,'validate_'+('weather' if source=='weather' else 'air_quality')+'_target')(df,spark.table(target),kind)
-        if commit: complete_files(spark,source,scope)
-        return ValidationResult('silver:'+source,{'processed_files':len(scope),'committed':commit}).report()
+            if not has_pending or not validate_only or spark.catalog.tableExists(targets[kind]):
+                target=spark.table(targets[kind])
+                if source=='earthquakes':validators.validate_earthquake_target(df,target,kind)
+                else:getattr(validators,'validate_'+source+'_target')(df,target,kind)
+        if not validate_only and mark_completed:complete_files(spark,source,manifest,cfg)
+        result=ValidationResult('silver',{'validated':True,'written':not validate_only and has_pending,'marked_completed':not validate_only and mark_completed},context={'run_id':manifest['run_id'],'source':source})
+        return result.report() if report else result
+    except ValidationError as exc:
+        raise contextualize(exc,run_id=manifest['run_id'],source=source) from None
     finally:
-        for df in outputs.values(): df.unpersist()
+        for df in outputs.values():df.unpersist()
         bronze.unpersist()
