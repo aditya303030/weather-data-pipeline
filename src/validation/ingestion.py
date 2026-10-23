@@ -1,5 +1,5 @@
 """Pure API contract checks; transport/retries remain in ingestion."""
-from src.contracts import variables, EQ_DOUBLES, EQ_LONGS, EQ_STRINGS, CURRENT_TYPES, specs
+from src.contracts import variables, EQ_DOUBLES, EQ_LONGS, EQ_STRINGS, CURRENT_TYPES, specs, AQI_FIELDS, DAILY_RELATIONSHIPS
 from .common import require, numeric, timestamp, ValidationResult
 
 def validate_response(source,data):
@@ -38,13 +38,13 @@ def validate_response(source,data):
                 timestamp(block.get('time'));numeric(block.get('interval'),0)
                 require(block.get('interval') is None or type(block['interval']) is int,'Optional interval must be integer seconds',stage='api')
                 for name in variables(source,section):
-                    value=block.get(name);numeric(value)
+                    value=block.get(name);numeric(value,0 if source=='air_quality' and name in AQI_FIELDS else None)
                     if CURRENT_TYPES[source][name]=='int':require(value is None or float(value).is_integer(),'Integer measurement is fractional',stage='api')
                     if name=='is_day':require(value is None or value in (0,1),'is_day must be 0 or 1',stage='api')
             else:
                 times=block.get('time');require(isinstance(times,list) and bool(times),'Missing '+section+'.time',stage='api')
-                require(all(isinstance(t,str) for t in times) and len(times)==len(set(times)),'Invalid/duplicate forecast timestamps',stage='api')
-                for t in times:timestamp(t)
+                normalized=[timestamp(t,kind='date' if section=='daily' else 'api') for t in times]
+                require(len(normalized)==len(set(normalized)),'Duplicate normalized forecast timestamps/dates',stage='api',check='normalized_time_uniqueness')
                 for name in variables(source,section):
                     values=block.get(name)
                     if values is None:continue # Optional absent arrays become typed null arrays in transforms.
@@ -53,8 +53,13 @@ def validate_response(source,data):
                         if name in ('sunrise','sunset'):
                             if value is not None:timestamp(value)
                         else:
-                            numeric(value)
+                            numeric(value,0 if source=='air_quality' and name in AQI_FIELDS else None)
                             field_type=dict((n,t) for n,_,t in specs(source,section))[name]
                             if field_type=='int':require(value is None or float(value).is_integer(),'Integer measurement is fractional',stage='api')
                             if name=='is_day':require(value is None or value in (0,1),'is_day must be 0 or 1',stage='api')
+                if source=='weather' and section=='daily':
+                    for low,high in DAILY_RELATIONSHIPS:
+                        lower=block.get(low);upper=block.get(high)
+                        if lower is not None and upper is not None:
+                            require(all(a is None or b is None or a<=b for a,b in zip(lower,upper)),low+' must be <= '+high,stage='api',check=low+'_le_'+high)
     return ValidationResult('api',{'contract':True},context={'source':source})

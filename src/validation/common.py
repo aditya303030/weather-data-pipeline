@@ -2,7 +2,9 @@
 from dataclasses import dataclass, field, asdict
 import json
 import math
-from datetime import datetime
+from datetime import datetime, timezone
+import re
+from functools import reduce
 
 @dataclass
 class CheckResult:
@@ -27,7 +29,7 @@ class ValidationResult:
     context: dict = field(default_factory=dict)
 
     def to_dict(self):
-        records=[asdict(CheckResult(self.stage, name, affected_rows=(value if type(value) is int and name.startswith(('key:','range:','timestamp:','duplicate')) else None), details={'value':value}, context=self.context)) for name,value in self.checks.items()]
+        records=[asdict(CheckResult(self.stage, name, affected_rows=(value if type(value) is int and (name=='affected_rows' or name.startswith(('key:','range:','timestamp:','duplicate'))) else None), details={'value':value}, context=self.context)) for name,value in self.checks.items()]
         records += [asdict(CheckResult(self.stage, 'warning', severity='warning', passed=False, details={'message':w}, context=self.context)) for w in self.warnings]
         return {'stage':self.stage, 'results':records, 'context':self.context}
 
@@ -40,14 +42,56 @@ def require(condition, message, *, stage='validation', check='requirement', affe
         raise ValidationError(message, CheckResult(stage,check,passed=False,affected_rows=affected_rows,details={'message':message},context=context or {}))
 
 
-def timestamp(value, *, offset_required=False):
-    require(isinstance(value, str) and bool(value.strip()), 'Missing timestamp')
+def timestamp(value, *, offset_required=False, kind=None):
+    """Extended ISO only. Naive API times mean UTC; aware times normalize to UTC.
+
+    Date: YYYY-MM-DD. Datetime: YYYY-MM-DDTHH:MM[:SS[.1..6 digits]],
+    optionally Z or +/-HH:MM; retrieval timestamps must include an offset.
+    Raw strings are preserved; return values are normalized comparison keys.
+    """
+    kind = kind or ('retrieval' if offset_required else 'api')
+    require(kind in ('date','api','retrieval'),'Unsupported timestamp kind',check='timestamp_format')
+    require(isinstance(value,str) and bool(value),'Missing timestamp',check='timestamp_format')
+    pattern = r'\d{4}-\d{2}-\d{2}' if kind=='date' else r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?'
+    require(re.fullmatch(pattern,value) is not None,'Unsupported timestamp format',check='timestamp_format')
+    offset=re.search(r'([+-])(\d{2}):(\d{2})$',value) if kind!='date' else None
+    if offset:
+        hours,minutes=int(offset[2]),int(offset[3])
+        require(minutes<60 and (hours<18 or (hours==18 and minutes==0)),'Unsupported UTC offset',check='timestamp_offset')
     try:
-        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
-    except ValueError as exc:
-        raise ValidationError('Invalid ISO timestamp') from exc
-    require(not offset_required or parsed.tzinfo is not None, 'Timestamp must include UTC offset')
-    return parsed
+        parsed=datetime.fromisoformat(value.replace('Z','+00:00'))
+    except ValueError:
+        raise ValidationError('Impossible date/time') from None
+    if kind=='date':return parsed.date()
+    require(not (offset_required or kind=='retrieval') or parsed.tzinfo is not None,'Retrieval timestamp requires an offset',check='timestamp_offset')
+    try:return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except (ValueError,OverflowError):raise ValidationError('Timestamp outside supported UTC range') from None
+
+
+def aggregate_rules(df, conditions, *, include_rows=False):
+    """One scan: per-rule occurrences and distinct rows failing any rule.
+
+    Nullable predicates mean false unless a rule explicitly tests null presence.
+    """
+    from pyspark.sql import functions as F
+    normalized={n:F.coalesce(p,F.lit(False)) for n,p in conditions.items()}
+    any_bad=reduce(lambda a,b:a|b,normalized.values(),F.lit(False))
+    exprs=[F.sum(F.when(any_bad,1).otherwise(0)).alias('_affected_rows')]
+    if include_rows:exprs.append(F.count('*').alias('_rows'))
+    exprs += [F.sum(F.when(p,1).otherwise(0)).alias('_rule_'+str(i)) for i,p in enumerate(normalized.values())]
+    row=df.agg(*exprs).first().asDict()
+    counts={n:row['_rule_'+str(i)] or 0 for i,n in enumerate(normalized)}
+    return {'rows':row.get('_rows',0),'affected_rows':row['_affected_rows'] or 0,
+            'failed_check_occurrences':sum(counts.values()),'counts':counts}
+
+
+def enforce_rules(stats,stage,check):
+    failures={n:v for n,v in stats['counts'].items() if v}
+    if failures:
+        raise ValidationError('Invalid records',CheckResult(stage,check,passed=False,
+            affected_rows=stats['affected_rows'],details={'message':'Invalid records: '+str(failures),
+            'per_check':failures,'failed_check_occurrences':stats['failed_check_occurrences']}))
+
 
 def numeric(value, lower=None, upper=None, *, nullable=True):
     if value is None and nullable:
@@ -95,16 +139,13 @@ def check_frame(df, *, stage, keys, required=None, ranges=None, timestamps=(), n
         if hi is not None: bad = bad | (c > hi)
         conditions['range:' + name] = c.isNotNull() & bad
     conditions.update(predicates or {})
-    exprs = [F.count('*').alias('rows')]
-    exprs += [F.sum(F.when(v, 1).otherwise(0)).alias('c'+str(i)) for i,v in enumerate(conditions.values())]
-    stats = df.agg(*exprs).first().asDict()
-    require(not nonempty or stats['rows'] > 0, stage + ': empty output is forbidden')
-    failures = {name: stats['c'+str(i)] for i,name in enumerate(conditions) if stats['c'+str(i)]}
-    require(not failures, f'{stage}: invalid records: {failures}',stage=stage,check='record_quality',affected_rows=sum(failures.values()))
+    stats=aggregate_rules(df,conditions,include_rows=True)
+    require(not nonempty or stats['rows']>0,stage+': empty output is forbidden',stage=stage)
+    enforce_rules(stats,stage,'record_quality')
     if keys:
         duplicates = df.groupBy(*keys).count().filter(F.col('count') > 1).agg(F.sum('count').alias('affected')).first().affected or 0
         require(not duplicates, stage + ': duplicate source keys ' + str(keys),stage=stage,check='duplicate_keys',affected_rows=duplicates)
-    return ValidationResult(stage, {'rows': stats['rows'], 'keys': keys, **{name:stats['c'+str(i)] or 0 for i,name in enumerate(conditions)}})
+    return ValidationResult(stage, {'rows': stats['rows'], 'keys': keys, 'affected_rows':stats['affected_rows'],'failed_check_occurrences':stats['failed_check_occurrences'],**stats['counts']})
 
 def compatible_target(source, target):
     """Fail before writes rather than dropping/recreating an existing table."""
@@ -134,9 +175,7 @@ def normalize_output(df, types):
         if typ in ('int','long','boolean'):
             raw=F.col(n).cast('double')
             invalid[n]=invalid[n] | (F.col(n).isNotNull() & (raw != (casted[n].cast('int') if typ=='boolean' else casted[n]).cast('double')))
-    row=df.agg(*[F.sum(F.when(p,1).otherwise(0)).alias(n) for n,p in invalid.items()]).first().asDict()
-    failures={n:v for n,v in row.items() if v}
-    require(not failures,'Invalid casts: '+str(failures),stage='silver',check='casts',affected_rows=sum(failures.values()))
+    enforce_rules(aggregate_rules(df,invalid),'silver','casts')
     return df.select(*[c.alias(n) for n,c in casted.items()])
 
 # Context is attached at orchestration boundaries without repeating it in every
@@ -144,3 +183,15 @@ def normalize_output(df, types):
 def contextualize(error, **context):
     error.result.context.update(context)
     return ValidationError(error.result.details.get('message','Validation failed'),error.result)
+
+
+def measurement_completeness(df, source, kind=None):
+    """Nonblocking usefulness report. No minimum coverage requirement is imposed."""
+    from src.contracts import CORE_MEASUREMENTS
+    from pyspark.sql import functions as F
+    fields=[n for n in CORE_MEASUREMENTS[source] if n in df.columns]
+    any_value=reduce(lambda a,b:a|b,(F.col(n).isNotNull() for n in fields),F.lit(False))
+    row=df.agg(F.count('*').alias('rows'),F.sum(F.when(any_value,1).otherwise(0)).alias('useful')).first()
+    empty=row.rows-(row.useful or 0)
+    return ValidationResult('completeness',{'rows':row.rows,'measurement_empty_rows':empty},
+        ['Core measurements absent in '+str(empty)+' rows; structure is valid'] if empty else [],{'source':source,'kind':kind})

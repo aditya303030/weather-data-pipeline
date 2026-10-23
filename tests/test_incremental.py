@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock,patch
 from helpers import config_at
 from src.transformations.silver import run_silver
-from src.validation.common import ValidationError
+from src.validation.common import ValidationError,ValidationResult
 
 class IncrementalTests(unittest.TestCase):
     def setUp(self):
@@ -25,6 +25,8 @@ class IncrementalTests(unittest.TestCase):
             'import_module':{'side_effect':module},'pending_files':{'side_effect':pending},
             'merge_output':{'side_effect':write},'complete_files':{'side_effect':complete},
             'preflight_outputs':{'side_effect':preflight},
+            'validate_missing_targets':{'return_value':[]},
+            'measurement_completeness':{'return_value':ValidationResult('completeness',{'rows':1})},
         }.items():stack.enter_context(patch('src.transformations.silver.'+name,**options))
         return stack
     def test_partial_write_retries_immutable_scope_and_commits_last(self):
@@ -79,3 +81,35 @@ class IncrementalTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError,'Missing required persisted'):
                 run_silver(spark,'weather','/manifest',self.cfg,validate_only=True,require_targets=True)
         spark.sql.assert_not_called();write.assert_not_called();complete.assert_not_called()
+
+    def test_completed_corruption_default_detects_and_explicit_repair_writes(self):
+        for source in ('weather','air_quality'):
+            bronze,frames,module=self.scenario()
+            if source=='air_quality':frames.pop('daily')
+            validators=module('validation')
+            setattr(validators,'validate_'+source+'_target',Mock(side_effect=ValidationError('target corrupted')))
+            pending=Mock();pending.return_value.limit.return_value.count.return_value=0
+            write=Mock();complete=Mock()
+            with self.patches(bronze,module,pending,write,complete):
+                with self.assertRaises(ValidationError):run_silver(Mock(),source,'/manifest',self.cfg)
+            write.assert_not_called();complete.assert_not_called()
+            getattr(validators,'validate_'+source+'_target').side_effect=None
+            with self.patches(bronze,module,pending,write,complete):
+                result=run_silver(Mock(),source,'/manifest',self.cfg,repair=True)
+            self.assertEqual(write.call_count,len(frames))
+            self.assertTrue(result.checks['repair_requested']);self.assertTrue(result.checks['written']);self.assertTrue(result.checks['reconciled'])
+    def test_failed_repair_retries_without_clearing_ledger(self):
+        bronze,frames,module=self.scenario();pending=Mock();pending.return_value.limit.return_value.count.return_value=0
+        complete=Mock();written=[]
+        def write(*args,**kwargs):
+            written.append(args[2])
+            if len(written)==2:raise RuntimeError('repair interrupted')
+        with self.patches(bronze,module,pending,write,complete):
+            with self.assertRaises(RuntimeError):run_silver(Mock(),'weather','/manifest',self.cfg,repair=True)
+            complete.assert_not_called()
+            run_silver(Mock(),'weather','/manifest',self.cfg,repair=True)
+            complete.assert_called_once()
+    def test_repair_read_only_is_rejected_before_any_access(self):
+        spark=Mock()
+        with self.assertRaises(ValidationError):run_silver(spark,'weather','/manifest',self.cfg,repair=True,validate_only=True)
+        spark.table.assert_not_called();spark.sql.assert_not_called()

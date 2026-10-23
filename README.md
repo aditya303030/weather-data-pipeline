@@ -236,3 +236,204 @@ Before live scheduling, in an isolated Databricks environment:
 8. Verify automatic/explicit job context task values, Volume publication behavior, and task parameter wiring with a small manually started test run. A blocking upstream validation must leave downstream All-succeeded tasks unexecuted.
 
 These Databricks steps were not run. No successful live execution is claimed.
+
+## Targeted reconciliation and repair regressions
+
+The changes below tighten validation without changing committed membership, stable
+keys, output schemas, configuration fingerprints, or the optional-field policy.
+
+### Earthquake version and full-content reconciliation
+
+`validate_earthquake_target()` uses the same ordering as production MERGE:
+`updated_at`, then `snapshot_at`. A missing event or an older target fails. For an
+identical version it compares **every expected persisted column**, including nullable
+measurements, coordinates, status, arrays and lineage, using null-safe equality.
+Plausible but changed content can no longer pass on timestamp ordering alone.
+
+A genuinely newer target is retained during older-manifest replay. Its content must
+match the exact newer history version. Persisted history is only a locator: the
+orchestrator's `verified_newer_history()` locates its committed run from file lineage,
+checks manifest membership/digests and Bronze membership, rebuilds from digest-verified raw JSON (using Bronze only for validated ingestion lineage),
+reruns the production transform, reconciles persisted history with that independent result, and supplies
+that reconstructed evidence explicitly to latest-target validation. The target is
+never its own reference. Missing/inconsistent evidence fails with an instruction
+to select the relevant newer committed scope. Evidence reconstruction is read-only
+and bounded to ten newer source files/runs per invocation; larger scopes require
+explicit recovery of the relevant newer runs first. No live APIs are refetched.
+
+This means old replay now requires retained raw files, their commit records, Bronze
+lineage and exact newer event history. Legacy uncommitted lineage must be explicitly
+adopted. Corruption in both latest and persisted history is not accepted merely
+because the two agree: history is checked against committed inputs.
+
+### Default replay versus explicit scoped repair
+
+Default replay still skips writes for completed files and validates persisted
+outputs. Deletion/corruption fails; it is not automatically rewritten. Deliberate
+repair uses the exact same trusted manifest/configuration and all source validation,
+all-output preflight, production MERGE and post-write reconciliation:
+
+```python
+from src.transformations.silver import run_silver
+result = run_silver(spark, 'weather', manifest_path, cfg, repair=True)
+```
+
+The Silver notebook adapters also accept `repair=true` (default `false`) with the
+same `manifest_path` and `config_path`. Standalone `run_validation` remains read-only
+and exposes no repair flag. `repair=True, validate_only=True` is rejected before
+processing. Repair does not remove or clear ledger rows. Results explicitly report
+`repair_requested`, `written`, `reconciled`, recreated tables and restored run scope.
+A partial repair can leave some writes in place; explicit retry replays stable keys.
+There is no cross-table rollback or transaction guarantee.
+
+Same-version earthquake corruption is replaced from the selected committed input.
+An older scope cannot overwrite a newer event. If that newer target is corrupt,
+older repair fails before writes and asks for the newer scope; it does not guess
+or roll back the event. Select and repair the newer committed manifest, then retry
+the old replay if needed.
+
+Missing historical tables require a separate deliberate reconstruction mode:
+
+```python
+from src.transformations.recovery import recover_committed
+results = recover_committed(
+    spark, [exact_manifest_path_1, exact_manifest_path_2], 'weather', cfg,
+    repair=True, rebuild_missing=True, max_runs=10,
+)
+```
+
+Before a missing table is created, the supplied bounded, unique, committed scopes
+must cover **all completion-ledger paths/run IDs for that source**, and the current
+manifest must be included. A single manifest cannot recreate a multi-run table if
+other completed scopes exist. Missing or unverified completion history blocks
+reconstruction; use reviewed adoption/new targets rather than bypassing it. Tables
+can be partially reconstructed if a later scope fails; rerun the complete explicit
+list under the single-writer rule. Reports identify selected/restored run IDs and
+always avoid claiming universal full-history restoration. The coverage boundary is
+verified ledger history, not unknown legacy rows outside that history. Preserve
+backups and reconcile any legacy population separately. No ledger clearing is used.
+
+### Timestamp acceptance before commit
+
+Accepted forms are explicit and Spark-compatible:
+
+| Field | Accepted format |
+| --- | --- |
+| Retrieval timestamp | `YYYY-MM-DDTHH:MM[:SS[.ffffff]]` with `Z` or `+/-HH:MM` required |
+| Current/hourly | Same extended datetime syntax; offset optional |
+| Daily time | Exactly `YYYY-MM-DD` |
+| Optional sunrise/sunset | Same extended datetime syntax as current/hourly, or null |
+
+Fractional seconds contain 1–6 digits and require a seconds component. Naive API
+datetimes mean UTC. Supported offset-bearing strings are interpreted as their UTC
+instant, not rewritten in raw JSON. Offsets are limited to Java/Spark-compatible
+`-18:00..+18:00`, with minutes <60 and no minutes beyond 18 hours. Impossible dates,
+empty/null required values, compact ISO (`20261021T000000`), excessive fractional
+precision, and unsupported formats fail. Pipeline-generated UTC retrieval timestamps
+remain valid. Daily dates cannot carry times/offsets.
+
+Hourly uniqueness uses normalized UTC instants: `Z`, `+00:00`, naive UTC and a
+nonzero offset representing the same instant are duplicates and fail **before
+commit**. Daily uniqueness uses parsed dates. Silver key validation remains a second
+gate. No duplicate is dropped or arbitrarily selected. Original raw JSON is preserved.
+
+### Shared domains, completeness and row metrics
+
+`AQI_FIELDS` derives supported fields from the shared contract. All six US component
+indices (`us_aqi_pm2_5`, `us_aqi_pm10`, `us_aqi_ozone`, `us_aqi_nitrogen_dioxide`,
+`us_aqi_sulphur_dioxide`, `us_aqi_carbon_monoxide`) plus aggregate indices must be
+nonnegative when present, in current/hourly API data and Silver. Zero and null are
+valid. No upper bound or nonexistent European component columns were added.
+
+Both raw daily arrays and Silver daily rows enforce `temperature_2m_min <=
+temperature_2m_max` and `apparent_temperature_min <= apparent_temperature_max` when
+both values exist. Equal values and either/both null are valid. Structured errors
+name the failed relationship; values are never swapped or corrected.
+
+`aggregate_rules()` combines compatible rules in one aggregate:
+
+- `affected_rows`: distinct rows failing at least one rule, null predicates treated
+  as false unless the rule explicitly checks null presence.
+- Per-rule counts remain available in `per_check` failure details.
+- `failed_check_occurrences`: sum of per-rule failures; may exceed affected rows.
+- Cast checks use the same definition; two bad casts in one row affect one row.
+- Duplicate-key checks separately count every row in a repeated-key group (not only
+  the excess rows). Different key groups are disjoint, so this count does not overlap.
+- Empty frames have zero affected rows; source-specific nonempty policies still apply.
+
+All optional measurements remain optional. `measurement_completeness()` emits a
+nonblocking warning/count of rows missing core measurements: weather current/hourly
+temperature or daily min/max; AQ PM2.5, PM10 and aggregate US AQI. A measurement-empty
+output can have valid structure. Other useful measurements may still be present;
+this is a core-completeness indicator, not a universal usefulness judgment. Regional
+and seasonal nulls remain valid. A future configurable blocking coverage threshold
+would belong in source validation plus explicit versioned configuration, not an
+implicit ingestion or notebook filter. No such threshold is imposed here.
+
+Previously committed invalid AQI, contradictory temperatures or newly unsupported
+timestamp formats now fail replay gates. No files, manifests, tables or state are
+rewritten automatically. Preserve originals and perform reviewed replacement/adoption
+where needed. No new Silver schema migration is introduced by these targeted fixes.
+
+### Separate Databricks / serverless Spark Connect runner
+
+Local tests remain local. The separate thin entry point is
+`notebooks/integration/regressions.ipynb`, importing `src.integration.runner` and using
+the existing `spark` session:
+
+```python
+from src.integration.runner import run_regressions
+integration_result = run_regressions(
+    spark, '/Workspace/.../config/isolated.example.json'
+)
+```
+
+Or manually execute that notebook with widget/job parameter `config_path` set to
+the complete isolated JSON file. This runner is **not scheduled or executed by local
+checks**. It refuses missing configs, the default production catalog, catalogs
+without a test/sandbox marker, nonmatching Volume roots and existing suite tables
+or schemas. Before its first write, it derives/checks unique suite-specific Bronze/
+Silver schemas, ledger name, raw/control/state subdirectories inside the explicit
+test catalog. Provision the base test Volumes/schemas first. Base existing test
+pipeline tables and checkpoints are not reused. Inputs/configuration must still be
+reviewed by the operator; naming guards are not an authorization system.
+
+Fixtures are synthetic and HTTP is explicitly blocked. All Spark fixture creation
+uses the supplied session (`createDataFrame` with explicit schemas / `range`);
+there is no local-session construction, `sparkContext`, shared-session stop or
+automatic cleanup. The runner calls production transforms, validation, Auto Loader
+and MERGE. Test-only mocks inject early-write and post-write failures; there is no
+production failure-injection switch.
+
+It covers full-content/version relationships, distinct-row metrics, timestamp
+parsing, all supported AQI components, daily relationships and optional completeness;
+two committed runs with fewer locations in the second; older replay/newer evidence;
+checkpoint replay; failed uncommitted input exclusion; preflight schema mismatch;
+partial-write and post-write failure/retry; completed-row repair; zero events; and
+bounded missing-table reconstruction. Exact synthetic inputs/plans, assertion
+outcomes, expected/unexpected exceptions, effective config and before/after table/
+ledger snapshots are saved under the returned `artifact_root` (`results.json`,
+`effective-config.json`). Test-created mismatch/backup tables and raw artifacts are
+retained for inspection. An interrupted report is not a successful test result.
+Cleanup requires a separate explicit operator action, limited to the recorded suite.
+
+Run locally:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 venv/bin/python -B -m unittest discover -s tests -v
+```
+
+`tests/test_targeted.py` exercises pure pre-commit contracts. Optional
+`tests/test_targeted_spark.py` uses the same Spark Connect-compatible regression
+cases with a local session. Existing local Spark/Delta tests remain separate.
+Skipped Spark tests are not passed tests; mocks do not establish Databricks behavior.
+Do not run the local-session tests on the shared serverless session.
+
+A separate **manual, unscheduled job-gating test** still must be performed later:
+configure ingestion → each Bronze → corresponding Silver with the exact task-value
+manifest/config wiring and **Run if: All succeeded**. Use only isolated targets,
+start one small run manually, verify `run_id`/`manifest_path` task values and checkpoint
+replay, then introduce a controlled invalid synthetic fixture in a test-only adapter
+and confirm downstream tasks are skipped. Keep this independent of the integration
+notebook's in-process mocks. Do not create a schedule, do not use production data,
+and do not treat the in-process runner as proof of job dependency behavior.

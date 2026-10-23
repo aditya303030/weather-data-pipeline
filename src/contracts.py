@@ -43,3 +43,12 @@ def output_types(source,kind):
 def variables(source,section):
     if source=='weather': return globals()['WEATHER_'+section.upper()+'_VARS'].split(',')
     return globals()['AQ_'+section.upper()+'_VARS'].split(',')
+
+# Shared domains; no invented European component fields or arbitrary AQI ceiling.
+AQI_FIELDS = tuple(n for n in CURRENT_TYPES['air_quality'] if 'aqi' in n)
+DAILY_RELATIONSHIPS = (
+    ('temperature_2m_min', 'temperature_2m_max'),
+    ('apparent_temperature_min', 'apparent_temperature_max'),
+)
+CORE_MEASUREMENTS = {'weather': ('temperature_2m','temperature_2m_min','temperature_2m_max'),
+                     'air_quality': ('pm2_5','pm10','us_aqi')}
