@@ -3,6 +3,10 @@
 .databricks
 
 venv/
+.venv-databricks
 __pycache__/
 *.pyc
 .pytest_cache/
+
+check_databricks_connection.py
+.venv-databricks/
