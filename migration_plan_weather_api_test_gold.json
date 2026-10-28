@@ -1,0 +1,141 @@
+{
+  "_NOTE": "SUMMARY ONLY - view DDL replaced with names. Complete plan at /Users/adityarajsharma3030@gmail.com/gold-migration/migration_plan_weather_api_test_gold_complete.json",
+  "_NOTE": "SUMMARY ONLY - view DDL replaced with names. Complete plan at /Users/adityarajsharma3030@gmail.com/gold-migration/migration_plan_weather_api_test_gold_complete.json",
+  "metadata": {
+    "mode": "V1_TO_V2_REVIEW_ONLY",
+    "contract": "3d2fea8d5ef9ebcc5befbf2be8b6b606b6bda4f6fc2a84d7fd9ea112abaacdb6",
+    "active_release": "35803cd98b5117449ecc9c2a660e73a5",
+    "target": "weather_api_test.gold",
+    "migration_id": "b497bc297a89d55734a0e8cb3a8f0b274d6dc3f96cd04f6a2499bf269deb5804",
+    "admission": "LEGACY_ACTIVE_ONLY; new V2 build required for published history",
+    "source_config_path": "/Workspace/Users/adityarajsharma3030@gmail.com/weather-data-pipeline/config/isolated.example.json",
+    "generated_at": "2026-10-26T22:35:00Z",
+    "notebook_contract_version": "gold-notebooks-v2"
+  },
+  "v1_state": {
+    "control_table_contract": "gold-notebooks-v1",
+    "active_release": "35803cd98b5117449ecc9c2a660e73a5",
+    "failed_release": "26551d8e31981bf7ae5c34c82d760f79",
+    "release_count": 3,
+    "stage_count": 8,
+    "owner": "adityarajsharma3030@gmail.com",
+    "grants": "none",
+    "object_count": 33,
+    "managed_table_count": 13,
+    "view_count": 20,
+    "v1_control_schemas": {
+      "_gold_active": ["singleton INT", "release_id STRING"],
+      "_gold_releases": ["release_id STRING", "contract_id STRING", "source_config_id STRING", "input_versions STRING", "eligible_paths STRING", "settings STRING", "built_at TIMESTAMP", "report STRING", "published_at TIMESTAMP"],
+      "_gold_stages": ["release_id STRING", "stage_name STRING", "status STRING", "counts_json STRING", "completed_at TIMESTAMP", "error_type STRING"]
+    },
+    "v2_added_columns": {
+      "_gold_active": ["generation BIGINT", "writer_token STRING", "writer_stage STRING", "writer_acquired_at TIMESTAMP", "deployment_contract STRING"],
+      "_gold_releases": ["expected_predecessor STRING", "expected_generation BIGINT", "evidence_id STRING", "publication_state STRING", "health STRING", "verified_at TIMESTAMP"],
+      "_gold_stages": ["output_versions STRING"]
+    }
+  },
+  "baseline_versions": {
+    "_data_air_quality_current_latest": 6,
+    "_data_air_quality_hourly_latest": 6,
+    "_data_dim_location": 6,
+    "_data_earthquake_snapshot_audit": 4,
+    "_data_seismic_coverage": 4,
+    "_data_seismic_events_latest": 6,
+    "_data_weather_aq_coverage": 6,
+    "_data_weather_current_latest": 6,
+    "_data_weather_daily_latest": 6,
+    "_data_weather_hourly_latest": 6,
+    "_gold_active": 6,
+    "_gold_releases": 5,
+    "_gold_stages": 17
+  },
+  "baseline_snapshot": {
+    "metadata_hash": "c3341ba1f829f4ae3aa7e068740b4c8f6b55217e410687da4cc832fd469b46fe",
+    "versions": {
+      "_data_air_quality_current_latest": 6,
+      "_data_air_quality_hourly_latest": 6,
+      "_data_dim_location": 6,
+      "_data_earthquake_snapshot_audit": 4,
+      "_data_seismic_coverage": 4,
+      "_data_seismic_events_latest": 6,
+      "_data_weather_aq_coverage": 6,
+      "_data_weather_current_latest": 6,
+      "_data_weather_daily_latest": 6,
+      "_data_weather_hourly_latest": 6,
+      "_gold_active": 6,
+      "_gold_releases": 5,
+      "_gold_stages": 17
+    },
+    "object_count": 33
+  },
+  "statement_count": 59,
+  "groups": {
+    "control_columns": {
+      "count": 3,
+      "statements": [
+        "ALTER TABLE weather_api_test.gold._gold_active ADD COLUMNS (generation BIGINT,writer_token STRING,writer_stage STRING,writer_acquired_at TIMESTAMP,deployment_contract STRING)",
+        "ALTER TABLE weather_api_test.gold._gold_releases ADD COLUMNS (expected_predecessor STRING,expected_generation BIGINT,evidence_id STRING,publication_state STRING,health STRING,verified_at TIMESTAMP)",
+        "ALTER TABLE weather_api_test.gold._gold_stages ADD COLUMNS (output_versions STRING)"
+      ]
+    },
+    "backfills": {
+      "count": 3,
+      "statements": [
+        "UPDATE weather_api_test.gold._gold_active SET generation=0,writer_token=NULL,writer_stage=NULL,writer_acquired_at=NULL,deployment_contract='3d2fea8d5ef9ebcc5befbf2be8b6b606b6bda4f6fc2a84d7fd9ea112abaacdb6' WHERE singleton=1",
+        "UPDATE weather_api_test.gold._gold_releases SET expected_predecessor='',expected_generation=0,evidence_id=sha2(concat('legacy:',release_id),256),publication_state=CASE WHEN release_id='35803cd98b5117449ecc9c2a660e73a5' THEN 'LEGACY_ACTIVE' WHEN release_id IN ('26551d8e31981bf7ae5c34c82d760f79') THEN 'FAILED' ELSE 'CANDIDATE' END,health='UNKNOWN',verified_at=NULL",
+        "UPDATE weather_api_test.gold._gold_stages SET output_versions=CASE WHEN status='VALIDATED' THEN CASE stage_name WHEN 'weather' THEN '{\"dim_location\": 6, \"weather_current_latest\": 6, \"weather_daily_latest\": 6, \"weather_hourly_latest\": 6}' WHEN 'air_quality' THEN '{\"air_quality_current_latest\": 6, \"air_quality_hourly_latest\": 6, \"weather_aq_coverage\": 6}' WHEN 'earthquakes' THEN '{\"earthquake_snapshot_audit\": 4, \"seismic_coverage\": 4, \"seismic_events_latest\": 6}' ELSE '{}' END ELSE '{}' END"
+      ]
+    },
+    "metadata": {
+      "count": 13,
+      "pattern": "ALTER TABLE weather_api_test.gold.<table> SET TBLPROPERTIES ('weather_pipeline.gold.contract'='gold-notebooks-v2')",
+      "tables": ["_data_weather_aq_coverage", "_data_seismic_events_latest", "_data_weather_daily_latest", "_data_air_quality_current_latest", "_data_weather_current_latest", "_data_air_quality_hourly_latest", "_data_weather_hourly_latest", "_gold_active", "_data_dim_location", "_data_seismic_coverage", "_gold_releases", "_gold_stages", "_data_earthquake_snapshot_audit"]
+    },
+    "active_views": {
+      "count": 20,
+      "view_names": ["weather_api_test.gold.dim_location", "weather_api_test.gold.weather_current_latest", "weather_api_test.gold.weather_hourly_latest", "weather_api_test.gold.weather_daily_latest", "weather_api_test.gold.air_quality_current_latest", "weather_api_test.gold.air_quality_hourly_latest", "weather_api_test.gold.weather_aq_coverage", "weather_api_test.gold.seismic_events_latest", "weather_api_test.gold.earthquake_snapshot_audit", "weather_api_test.gold.seismic_coverage", "weather_api_test.gold.environment_hourly", "weather_api_test.gold.location_current", "weather_api_test.gold.sampled_location_hourly_summary", "weather_api_test.gold.weather_aq_freshness", "weather_api_test.gold.seismic_daily_summary", "weather_api_test.gold.seismic_grid_daily", "weather_api_test.gold.location_seismic_nearby", "weather_api_test.gold.seismic_freshness", "weather_api_test.gold.freshness_coverage", "weather_api_test.gold.publication_status"],
+      "note": "Full DDL regenerable via migration_plan(spark, ...)"
+    },
+    "historical_views": {
+      "count": 20,
+      "view_names": ["weather_api_test.gold.dim_location_history", "weather_api_test.gold.weather_current_latest_history", "weather_api_test.gold.weather_hourly_latest_history", "weather_api_test.gold.weather_daily_latest_history", "weather_api_test.gold.air_quality_current_latest_history", "weather_api_test.gold.air_quality_hourly_latest_history", "weather_api_test.gold.weather_aq_coverage_history", "weather_api_test.gold.seismic_events_latest_history", "weather_api_test.gold.earthquake_snapshot_audit_history", "weather_api_test.gold.seismic_coverage_history", "weather_api_test.gold.environment_hourly_history", "weather_api_test.gold.location_current_history", "weather_api_test.gold.sampled_location_hourly_summary_history", "weather_api_test.gold.weather_aq_freshness_history", "weather_api_test.gold.seismic_daily_summary_history", "weather_api_test.gold.seismic_grid_daily_history", "weather_api_test.gold.location_seismic_nearby_history", "weather_api_test.gold.seismic_freshness_history", "weather_api_test.gold.freshness_coverage_history", "weather_api_test.gold.published_releases"],
+      "note": "Full DDL regenerable via migration_plan(spark, ...)"
+    }
+  },
+  "new_views": ["air_quality_current_latest_history", "air_quality_hourly_latest_history", "dim_location_history", "earthquake_snapshot_audit_history", "environment_hourly_history", "freshness_coverage_history", "location_current_history", "location_seismic_nearby_history", "published_releases", "sampled_location_hourly_summary_history", "seismic_coverage_history", "seismic_daily_summary_history", "seismic_events_latest_history", "seismic_freshness_history", "seismic_grid_daily_history", "weather_aq_coverage_history", "weather_aq_freshness_history", "weather_current_latest_history", "weather_daily_latest_history", "weather_hourly_latest_history"],
+  "legacy_view_rollback": {
+    "count": 20,
+    "note": "20 original V1 view DDL statements captured by SHOW CREATE TABLE for rollback",
+    "views": ["weather_api_test.gold.weather_current_latest", "weather_api_test.gold.location_seismic_nearby", "weather_api_test.gold.seismic_events_latest", "weather_api_test.gold.seismic_daily_summary", "weather_api_test.gold.weather_daily_latest", "weather_api_test.gold.seismic_grid_daily", "weather_api_test.gold.seismic_freshness", "weather_api_test.gold.freshness_coverage", "weather_api_test.gold.location_current", "weather_api_test.gold.weather_aq_freshness", "weather_api_test.gold.weather_hourly_latest", "weather_api_test.gold.dim_location", "weather_api_test.gold.seismic_coverage", "weather_api_test.gold.air_quality_current_latest", "weather_api_test.gold.sampled_location_hourly_summary", "weather_api_test.gold.publication_status", "weather_api_test.gold.earthquake_snapshot_audit", "weather_api_test.gold.environment_hourly", "weather_api_test.gold.air_quality_hourly_latest", "weather_api_test.gold.weather_aq_coverage"]
+  },
+  "preconditions": [
+    "Stop all Gold workers and dashboard reads; recheck baseline versions immediately before applying",
+    "Reconfirm original source/manifest evidence; this plan checks copy integrity, not full raw-to-Silver fidelity",
+    "Keep original receipts, data, IDs, timestamps and contract hashes; never execute this plan as a notebook import side effect"
+  ],
+  "invariant_checks": [
+    "Legacy controls validated before planning",
+    "Exact active copy/schema/key reconciliation before planning",
+    "Full V2 controls and all copy content checks before completion"
+  ],
+  "recovery_procedure": {
+    "journal_table": "weather_api_test.gold._gold_migration",
+    "journal_schema": "singleton INT,migration_id STRING,plan_json STRING,checkpoint INT,expected_json STRING,inflight_index INT,status STRING,owner_token STRING",
+    "apply_function": "apply_migration_plan(session, plan, gold=GoldConfig(...), stop_after=N)",
+    "checkpoint_mechanism": "Per-statement durable checkpoint with inflight_index tracking",
+    "failure_states": {
+      "BLOCKED": "inflight_index is NULL; safe to retry from last checkpoint",
+      "NEEDS_REVIEW": "inflight_index is NOT NULL; uncertain DDL/DML acknowledgement requires admin inspection",
+      "COMPLETE": "All statements applied and verified; migration finished"
+    },
+    "rollback_steps": [
+      "1. migration_plan() is read-only; no DDL/DML executed during planning",
+      "2. If apply_migration_plan() fails BLOCKED: retry from last checkpoint",
+      "3. If apply_migration_plan() fails NEEDS_REVIEW: inspect SQL at inflight_index and Delta versions",
+      "4. To restore legacy views: execute 20 legacy_view_rollback DDL statements (original V1 definitions)",
+      "5. To restore V1 contract: ALTER TABLE <table> SET TBLPROPERTIES ('weather_pipeline.gold.contract'='gold-notebooks-v1')",
+      "6. V1 control columns can be restored via ALTER TABLE DROP COLUMNS",
+      "7. Never rebase a partial migration; inspect _gold_migration journal first"
+    ]
+  }
+}

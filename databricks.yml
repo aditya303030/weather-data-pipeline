@@ -6,6 +6,9 @@
 bundle:
   name: weather-data-pipeline
 
+include:
+  - resources/*.yml
+
 targets:
   dev:
     mode: development
