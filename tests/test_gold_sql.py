@@ -58,7 +58,7 @@ class GoldSQLTests(unittest.TestCase):
     def relation(self,name,q):return self.view(name,"SELECT 'release' _release_id,cast('2026-01-01T00:00:00Z' AS TIMESTAMP) _built_at,s.* FROM ("+q+') s')
     def mapping(self,stages):
         pointer=self.view('pointer',"SELECT 'release' release_id")
-        releases=self.view('releases',"SELECT 'release' release_id,"+literal(GoldConfig().json())+" settings,current_timestamp() published_at")
+        releases=self.view('releases',"SELECT 'release' release_id,"+literal(GoldConfig(catalog='weather_api_test').json())+" settings,current_timestamp() published_at")
         class Config:
             def table(_,name):return stages.get(name,{'_gold_active':pointer,'_gold_releases':releases}.get(name,name))
         return Config()
@@ -270,7 +270,7 @@ class GoldSQLTests(unittest.TestCase):
         registry=self.view('history_registry',"SELECT 1 location_id,'UTC' timezone")
         def two(name,query):return self.view(name,"SELECT 'a' _release_id,s.* FROM ("+query+") s UNION ALL SELECT 'b' _release_id,s.* FROM ("+query+') s')
         w=two('history_weather',measurement(raww,registry,'weather','hourly'));a=two('history_aq',measurement(rawa,registry,'air_quality','hourly'))
-        settings=self.view('history_settings',"SELECT release_id,"+literal(GoldConfig().json())+" settings FROM VALUES ('a'),('b') r(release_id)")
+        settings=self.view('history_settings',"SELECT release_id,"+literal(GoldConfig(catalog='weather_api_test').json())+" settings FROM VALUES ('a'),('b') r(release_id)")
         mapping=dict.fromkeys(('dim_location','weather_current_latest','air_quality_current_latest','weather_aq_coverage'),'unused')|{'weather_hourly_latest':w,'air_quality_hourly_latest':a,'_gold_settings':settings}
         rows=self.db.query(N['air_quality_views'](mapping)['environment_hourly']+' ORDER BY _release_id')
         self.assertEqual(len(rows),2);self.assertEqual([r['_release_id'] for r in rows],['a','b'])
@@ -291,12 +291,33 @@ class GoldSQLTests(unittest.TestCase):
         w=self.frame('known_weather','weather','current',[{'location_id':raw['location_id'],'temperature_2m':raw['weather']['temperature_2m'],'observed_at':'2026-01-01T00:00:00Z'}])
         a=self.frame('known_aq','air_quality','current',[{'location_id':42,'pm2_5':raw['aq']['pm2_5'],'observed_at':'2026-01-01T00:00:00Z'}])
         wr=self.db.query(measurement(w,registry,'weather','current'))[0];ar=self.db.query(measurement(a,registry,'air_quality','current'))[0]
-        self.assertEqual((wr['location_id'],wr['temperature_2m'],wr['observed_at'].isoformat()),(42,12.75,'2026-01-01T00:00:00+00:00'))
+        # Session TZ is UTC; SQL-driver sessions return tz-aware datetimes while
+        # Spark Connect returns naive ones, so compare the UTC-normalized form.
+        observed=(wr['observed_at'].isoformat() or '').replace('+00:00','')
+        self.assertEqual((wr['location_id'],wr['temperature_2m'],observed),(42,12.75,'2026-01-01T00:00:00'))
         self.assertEqual(ar['pm2_5'],8.25)
         e=self.frame('known_event','earthquakes','history',[{'event_id':'known','magnitude':raw['earthquake']['magnitude'],'latitude':12.25,'longitude':179.75,'updated_at':'2026-01-02T00:00:00.123Z','updated_at_ms':1767312000123}])
         event=self.db.query(seismic(e))[0]
         self.assertEqual((event['magnitude'],event['latitude'],event['longitude'],event['updated_at_ms']),(-.5,12.25,179.75,1767312000123))
         self.assertEqual(event['updated_at'].microsecond,123000)
+
+    def test_country_attribution_land_and_unassigned(self):
+        # Attribution joins precomputed Natural Earth-derived H3 land cells; offshore or
+        # unmatched events carry explicit UNASSIGNED values, never NULL.
+        cells=self.view('country_cells',f"SELECT {604222352263217151} cell,'USA' country_code,'United States' country_name")
+        land=self.frame('attr_land','earthquakes','history',[{'event_id':'attr_land','latitude':40.7128,'longitude':-74.0060}])
+        sea=self.frame('attr_sea','earthquakes','history',[{'event_id':'attr_sea','latitude':0.0,'longitude':-160.0}])
+        both=self.view('attr_both',f'SELECT * FROM {land} UNION ALL SELECT * FROM {sea}')
+        rows={r['event_id']:r for r in self.db.query(seismic(both,cells))}
+        self.assertEqual((rows['attr_land']['country_code'],rows['attr_land']['country_name']),('USA','United States'))
+        self.assertEqual((rows['attr_sea']['country_code'],rows['attr_sea']['country_name']),('UNASSIGNED','Unassigned (offshore or outside land boundaries)'))
+        # Without a country relation the attribution remains explicit, never NULL.
+        nodb={r['event_id']:r for r in self.db.query(seismic(both))}
+        self.assertEqual(nodb['attr_land']['country_code'],'UNASSIGNED')
+        self.assertEqual(nodb['attr_sea']['country_name'],'Unassigned (offshore or outside land boundaries)')
+        from src.validation.gold import validate_country_attribution
+        attributed=self.view('attr_rows',f'SELECT event_id,country_code,country_name FROM ({seismic(both,cells)})')
+        self.assertEqual(validate_country_attribution(self.db,attributed),{'total':2,'assigned':1,'unassigned':1})
 
     def test_publication_status_exposes_unhealthy_and_invalid_controls(self):
         releases=self.view('status_releases',"SELECT 'a' release_id,current_timestamp() built_at,cast(NULL AS TIMESTAMP) published_at,'{}' input_versions,'[]' eligible_paths,'PUBLISHED' publication_state,'UNHEALTHY' health")
@@ -427,7 +448,7 @@ class GoldSQLTests(unittest.TestCase):
             self.db.query(f"CREATE TABLE {cfg.table(target)} USING DELTA TBLPROPERTIES ('weather_pipeline.gold.contract'='gold-notebooks-v1') AS SELECT * FROM {source.table(target)} VERSION AS OF {pins[target]} WHERE _release_id={literal(rid)}")
         old={'_gold_active':'singleton,release_id','_gold_releases':'release_id,contract_id,source_config_id,input_versions,eligible_paths,settings,built_at,report,published_at','_gold_stages':'release_id,stage_name,status,counts_json,completed_at,error_type'}
         for name,columns in old.items():
-            projection=columns.replace('settings',literal(GoldConfig(schema=cfg.schema).json())+' settings')
+            projection=columns.replace('settings',literal(GoldConfig(catalog='weather_api_test', schema=cfg.schema).json())+' settings')
             where=' WHERE release_id='+literal(rid)
             self.db.query(f"CREATE TABLE {cfg.table(name)} USING DELTA TBLPROPERTIES ('weather_pipeline.gold.contract'='gold-notebooks-v1') AS SELECT {projection} FROM {source.table(name)} VERSION AS OF {pins[name]}{where}")
         for candidate,status in [('f'*32,'FAILED'),('e'*32,'BUILDING')]:
@@ -447,8 +468,8 @@ class GoldSQLTests(unittest.TestCase):
         from concurrent.futures import ThreadPoolExecutor
         import threading,time,sys
         root=Path(__file__).resolve().parents[1]
-        cfg=GoldConfig(schema='gold_verify_'+uuid.uuid4().hex[:12])
-        legacy=GoldConfig(schema='gold_verify_'+uuid.uuid4().hex[:12])
+        cfg=GoldConfig(catalog='weather_api_test', schema='gold_verify_'+uuid.uuid4().hex[:12])
+        legacy=GoldConfig(catalog='weather_api_test', schema='gold_verify_'+uuid.uuid4().hex[:12])
         def progress(label,**fields):print(json.dumps({'at':datetime.now().isoformat(),'phase':label,'target':cfg.schema,'legacy':legacy.schema,**self.db.metrics(),**fields}),file=sys.stderr,flush=True)
         progress('fresh-init-start')
         for statement in N['migration_plan'](project_root=root,gold=cfg)['sql']:self.db.query(statement)
@@ -505,7 +526,7 @@ class GoldSQLTests(unittest.TestCase):
         self.assertEqual(self.db.query('SELECT count(*) n FROM '+legacy.table('_gold_stages'))[0]['n'],5)
         progress('legacy-readable-not-falsely-admitted')
         self.publish_fixture(legacy,'d'*32,1);progress('new-v2-after-migration-published')
-        cfg_b=GoldConfig(schema=cfg.schema,nearby_radius_km=75,grid_degrees=1,alignment_seconds=60,stale_seconds=60)
+        cfg_b=GoldConfig(catalog='weather_api_test', schema=cfg.schema,nearby_radius_km=75,grid_degrees=1,alignment_seconds=60,stale_seconds=60)
         self.publish_fixture(cfg_b,'b'*32,1);expected_b=self.capture_history(cfg_b,'b'*32,products)
         self.assert_history(cfg,'a'*32,expected_a);self.assert_history(cfg_b,'b'*32,expected_b)
         for name in products:
@@ -525,7 +546,7 @@ class GoldSQLTests(unittest.TestCase):
         schema=getattr(self,'retained_schema',None)
         if not schema:self.skipTest('Explicit retained isolated schema required')
         from datetime import timezone
-        cfg=GoldConfig(schema=schema).validate()
+        cfg=GoldConfig(catalog='weather_api_test', schema=schema).validate()
         self.assertNotEqual(cfg.schema,'gold')
         for rid,temperature,aqi,grid,radius,threshold,label,staleness,events,hours in [
           ('a'*32,11.,50,2.,250.,900.,'within_threshold',10800.,2,5),
@@ -560,7 +581,7 @@ class GoldSQLTests(unittest.TestCase):
         schema=getattr(self,'retained_schema',None)
         if not schema:self.skipTest('Explicit retained isolated schema required')
         from unittest.mock import Mock
-        cfg=GoldConfig(schema=schema,nearby_radius_km=75,grid_degrees=1,alignment_seconds=60,stale_seconds=60).validate()
+        cfg=GoldConfig(catalog='weather_api_test', schema=schema,nearby_radius_km=75,grid_degrees=1,alignment_seconds=60,stale_seconds=60).validate()
         self.assertNotEqual(cfg.schema,'gold')
         ctx=self.isolated_context(cfg,'b'*32)
         before={name:N['_version'](self.db,cfg.table('_data_'+name)) for name in N['WEATHER_KEYS']}
@@ -597,7 +618,7 @@ class GoldSQLTests(unittest.TestCase):
         if not schema:self.skipTest('Explicit retained isolated schema required')
         import os,signal,subprocess,sys,tempfile,time
         from pathlib import Path
-        cfg=GoldConfig(schema=schema).validate();self.assertNotEqual(cfg.schema,'gold')
+        cfg=GoldConfig(catalog='weather_api_test', schema=schema).validate();self.assertNotEqual(cfg.schema,'gold')
         root=Path(__file__).resolve().parents[1]
         settings_path=str(Path(getattr(self,'connection_settings_path',str(root/'check_databricks_connection.py'))).resolve())
         child_code="""
@@ -608,7 +629,7 @@ from tests.test_gold_sql import N,GoldSQLTests,SQLExecutor,GoldConfig,connection
 settings=connection_settings(sys.argv[1]);settings['_socket_timeout']=60
 with sql.connect(**settings) as conn:
  test=GoldSQLTests('test_retained_isolated_hard_kill_recovery');test.db=SQLExecutor(conn,verbose=False);test.setUp()
- ctx=test.isolated_context(GoldConfig(schema=sys.argv[2]),'b'*32)
+ ctx=test.isolated_context(GoldConfig(catalog='weather_api_test', schema=sys.argv[2]),'b'*32)
  N['acquire_writer'](ctx,'weather')
  # All SQL is synchronous and terminal before handshake; submit nothing afterward.
  ready=Path(sys.argv[3]);pending=ready.with_suffix('.tmp')
@@ -647,7 +668,7 @@ with sql.connect(**settings) as conn:
     def test_retained_legacy_provenance_and_copies(self):
         schema=getattr(self,'retained_schema',None)
         if not schema:self.skipTest('Explicit retained migrated fixture required')
-        cfg=GoldConfig(schema=schema).validate();self.assertNotEqual(cfg.schema,'gold')
+        cfg=GoldConfig(catalog='weather_api_test', schema=schema).validate();self.assertNotEqual(cfg.schema,'gold')
         receipts={r['release_id']:r for r in self.db.query('SELECT * FROM '+cfg.table('_gold_releases'))}
         self.assertEqual(set(receipts),{'a'*32,'d'*32,'e'*32,'f'*32})
         original=receipts['a'*32]

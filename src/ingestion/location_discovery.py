@@ -666,11 +666,17 @@ def preserve_registry_settings(new_df, existing):
     ])
 
 def select_ingestion_locations(spark,source,limit,slot,config=None):
-    """Validate active registry before HTTP; collect only the deterministic request block."""
+    """Validate active registry before HTTP; select the complete enabled set.
+
+    Every enabled location for the source is selected, ordered by location_id:
+    rotation subsetting across runs is forbidden so a partial set can never
+    publish an apparently complete run, and weather/air_quality always process
+    the same enabled identity set. max_locations below the enabled count fails
+    loudly instead of silently retaining a smaller limit.
+    """
     from pyspark.sql import functions as F
-    from pyspark.sql.window import Window
     from src.validation.common import require
-    from src.validation.location_registry import validate_registry, validate_selection_input
+    from src.validation.location_registry import validate_registry, validate_selection_input, validate_selection_completeness
     cfg=(config or load_config()).validate()
     require(source in ('weather','air_quality'),'Unsupported location source',stage='registry')
     validate_selection_input([],limit,slot)
@@ -681,9 +687,9 @@ def select_ingestion_locations(spark,source,limit,slot,config=None):
     enabled=active.filter(F.col(source+'_enabled')==True)
     count=enabled.count()
     require(count>0,'No enabled locations for '+source,stage='registry')
-    start=(slot%((count+limit-1)//limit))*limit
-    selected=enabled.withColumn('_position',F.row_number().over(Window.orderBy('location_id'))).filter((F.col('_position')>start)&(F.col('_position')<=start+limit))
-    rows=selected.select('location_id',F.col('location_name').alias('name'),'latitude','longitude').collect()
+    require(count<=limit,'Enabled location count (%d) exceeds max_locations (%d); refusing silent rotation subsetting'%(count,limit),stage='registry',check='selection_completeness')
+    rows=enabled.select('location_id',F.col('location_name').alias('name'),'latitude','longitude').orderBy('location_id').collect()
     locations=[r.asDict() for r in rows]
     validate_selection_input(locations,limit,slot)
+    validate_selection_completeness([loc['location_id'] for loc in locations],[r.location_id for r in enabled.select('location_id').collect()])
     return locations

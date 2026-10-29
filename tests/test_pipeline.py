@@ -162,7 +162,12 @@ class ControlTests(Offline):
 
 class NotebookTests(Offline):
     def test_thin_notebooks(self):
+        # Gold notebooks are deliberate self-contained releases: definitions,
+        # runtime gates, and orchestration live in their tagged cells by design.
+        # Thinness applies to ingest/bronze/silver wrappers only.
+        excluded=(ROOT/'notebooks/gold').resolve()
         for p in [*ROOT.glob('notebooks/**/*.ipynb'),*ROOT.glob('src/**/*.ipynb')]:
+            if p.resolve().is_relative_to(excluded):continue
             for c in json.loads(p.read_text())['cells']:
                 if c['cell_type']!='code':continue
                 t=ast.parse(''.join(c['source']))

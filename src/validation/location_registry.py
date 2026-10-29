@@ -74,6 +74,21 @@ def validate_selection_input(locations,limit,slot):
         ids.append(loc['location_id'])
     require(len(ids)==len(set(ids)),'Duplicate selection identities',stage='registry')
 
+def validate_selection_completeness(selected_ids,enabled_ids):
+    """Selection must cover every enabled registry location exactly.
+
+    Rotation subsetting across runs is forbidden for ingestion: a run that would
+    miss enabled identities, repeat identities, or include disabled/unknown
+    identities fails here instead of publishing an apparently complete run.
+    This also guarantees weather and air_quality process the same enabled set.
+    """
+    require(bool(selected_ids) and bool(enabled_ids),'Selection requires enabled registry locations',stage='registry',check='selection_completeness')
+    require(len(selected_ids)==len(set(selected_ids)),'Duplicate selection identities',stage='registry',check='selection_completeness')
+    missing=sorted(set(enabled_ids)-set(selected_ids));unexpected=sorted(set(selected_ids)-set(enabled_ids))
+    require(not missing and not unexpected,
+            'Selection must cover every enabled registry location exactly; refusing rotation subsetting. missing (sample): '+str(missing[:10])+' unexpected (sample): '+str(unexpected[:10]),
+            stage='registry',check='selection_completeness')
+
 def validate_activation_selection(registry,ids):
     from pyspark.sql import functions as F
     require(bool(ids),'No active IDs selected',stage='registry')

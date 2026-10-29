@@ -1,6 +1,6 @@
 # Weather data pipeline
 
-Raw → Bronze → Silver → Gold environmental-data pipeline. Gold is an explicit, unscheduled three-notebook release pipeline restricted to `weather_api_test.gold`. No jobs, deployments, schedules, live API checks, or catalog changes are performed by local tests.
+Raw → Bronze → Silver → Gold environmental-data pipeline. Gold is an explicit, unscheduled three-notebook release pipeline restricted to explicitly approved catalogs: `weather_api.gold` (production) and `weather_api_test.gold` (test). No jobs, deployments, schedules, live API checks, or catalog changes are performed by local tests.
 
 ## Responsibilities and entry points
 
@@ -44,6 +44,10 @@ Use `config/isolated.example.json` as a **complete** nonsecret configuration for
 from src.config import load_config
 cfg = load_config('/Workspace/path/to/config/isolated.example.json')
 ```
+
+`config/production.json` is the complete nonsecret production configuration for catalog `weather_api` (same schema/volume layout, no secret values). Gold deployment catalogs are an explicit allowlist (`APPROVED_GOLD_CATALOGS` in `src/validation/gold.py`): `weather_api` must use the canonical `gold` schema, while `weather_api_test` additionally permits disposable `gold_verify_<12 lowercase hex>` schemas. All three Gold notebooks take an explicit `catalog` widget with a blank default — a blank catalog fails validation instead of silently defaulting to the test catalog, and the Gold target catalog must equal the configured source (Silver/registry/ledger) catalog; mixed-catalog input/output is rejected. The first production Gold initialization is the `FIRST_RUN_EMPTY_STATE` provisioning plan (`migration_plan`/`_legacy_migration_plan` with `session=None`); the V1→V2 migration applies to the test deployment only. Changing the Gold notebooks or `src/validation/gold.py` changes the notebook contract hash: the existing `weather_api_test.gold` deployment keeps its deployed contract until an explicit reviewed re-migration is run; it is never silently overwritten.
+
+Seismic country attribution: `seismic_events_latest` (and its `_history` view) carry `country_code` (ISO 3166-1 alpha-3) and `country_name`, attributed via a precomputed `<catalog>.reference.country_h3_cells` table — H3 resolution-6 polyfill of the public-domain Natural Earth 110m admin-0 boundaries (v5.1.2; provenance and license recorded in `reference.country_boundaries`). Events with no land cell (offshore or outside coverage) carry explicit `UNASSIGNED` values, never NULL; boundary-shared cells are deduplicated deterministically (`min(country_code)`). `src.validation.gold.country_cells_relation` fails closed when the reference table is missing, and `validate_country_attribution` enforces the code format before any write.
 
 An explicit JSON config must contain exactly all `PipelineConfig` fields. Missing fields fail rather than falling back to production. Identifiers, paths, separate schemas/control roots and bounds are checked before writes. `/Volumes/...` paths must agree with the configured catalog and reference/raw/state schema. Fingerprints bind each plan/manifest to its exact configuration; retain that config when retrying an old run. A per-manifest limit defaults to 1000 files (maximum configurable 10000).
 

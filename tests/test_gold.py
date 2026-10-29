@@ -84,10 +84,12 @@ class GoldTests(unittest.TestCase):
         self.assertIsNotNone(out['feed_generated_ms'])
     def test_no_eligible_history_is_valid(self):self.assertEqual(eligible_manifests([],[],self.cfg),[])
     def test_gold_config_cannot_escape_or_modify_silver(self):
-        for cfg in [GoldConfig(catalog='weather_api'),GoldConfig(schema='silver'),GoldConfig(schema='x; DROP'),
-                    GoldConfig(nearby_radius_km=float('nan')),GoldConfig(grid_degrees=7),GoldConfig(max_runs=0)]:
+        for cfg in [GoldConfig(catalog='weather_api',schema='gold_verify_0123456789ab'),GoldConfig(catalog=''),GoldConfig(catalog='weather_api_test',schema='silver'),
+                    GoldConfig(catalog='weather_api_test',schema='x; DROP'),GoldConfig(catalog='weather_api_test',nearby_radius_km=float('nan')),
+                    GoldConfig(catalog='weather_api_test',grid_degrees=7),GoldConfig(catalog='weather_api_test',max_runs=0)]:
             with self.assertRaises(ValidationError):cfg.validate()
-        self.assertEqual(GoldConfig().validate().nearby_radius_km,250)
+        self.assertEqual(GoldConfig(catalog='weather_api').validate().schema,'gold')
+        self.assertEqual(GoldConfig(catalog='weather_api_test').validate().nearby_radius_km,250)
     def test_timezones_required_not_invented(self):
         validate_timezones([{'location_id':1,'timezone':'America/New_York'}])
         with self.assertRaises(ValidationError):validate_timezones([{'location_id':1,'timezone':'Unknown'}])
@@ -99,16 +101,16 @@ class GoldTests(unittest.TestCase):
     def test_failed_publication_restores_prior_pointer(self):
         db=PointerDB('old')
         with self.assertRaisesRegex(RuntimeError,'postwrite'):
-            activate_release(db,GoldConfig(),'new','old',lambda:(_ for _ in ()).throw(RuntimeError('postwrite')))
+            activate_release(db,GoldConfig(catalog='weather_api_test'),'new','old',lambda:(_ for _ in ()).throw(RuntimeError('postwrite')))
         self.assertEqual(db.active,'old')
     def test_idempotent_pointer_and_success(self):
         db=PointerDB('old');verified=[]
-        activate_release(db,GoldConfig(),'new','old',lambda:verified.append(True))
-        activate_release(db,GoldConfig(),'new','new',lambda:verified.append(True))
+        activate_release(db,GoldConfig(catalog='weather_api_test'),'new','old',lambda:verified.append(True))
+        activate_release(db,GoldConfig(catalog='weather_api_test'),'new','new',lambda:verified.append(True))
         self.assertEqual((db.active,len(verified)),('new',2))
     def test_competing_publication_fails_without_overwriting_other_release(self):
         db=PointerDB('other')
-        with self.assertRaises(ValidationError):activate_release(db,GoldConfig(),'new','old',lambda:None)
+        with self.assertRaises(ValidationError):activate_release(db,GoldConfig(catalog='weather_api_test'),'new','old',lambda:None)
         self.assertEqual(db.active,'other')
     def test_source_and_output_contracts_keep_advanced_fields(self):
         q=sql.measurement('s','r','weather','hourly')
@@ -141,7 +143,7 @@ class GoldTests(unittest.TestCase):
         class Context(dict):
             def close(self):self['closed']=True
         ctx=Context(release_id='candidate',sources={('weather',k):'source' for k in ('current','hourly','daily')},
-            stages={name:'stage' for name in N['WEATHER_KEYS']},report={},db=Mock(metrics=Mock(return_value={})),cfg=GoldConfig(),registry='registry')
+            stages={name:'stage' for name in N['WEATHER_KEYS']},report={},db=Mock(metrics=Mock(return_value={})),cfg=GoldConfig(catalog='weather_api_test'),registry='registry')
         status=Mock();activate=Mock()
         replacements={'prepare_context':Mock(return_value=ctx),'stage_products':Mock(return_value=dict.fromkeys(N['WEATHER_KEYS'],1)),
             'ensure_state':Mock(),'_active_id':Mock(return_value='prior'),'stage_status':status,
@@ -157,7 +159,7 @@ class GoldTests(unittest.TestCase):
         class Context(dict):
             def close(self):self['closed']=True
         ctx=Context(release_id='same',sources={('weather',k):'source' for k in ('current','hourly','daily')},
-            stages={name:'stage' for name in N['WEATHER_KEYS']},report={},db=Mock(metrics=Mock(return_value={})),cfg=GoldConfig(),registry='registry')
+            stages={name:'stage' for name in N['WEATHER_KEYS']},report={},db=Mock(metrics=Mock(return_value={})),cfg=GoldConfig(catalog='weather_api_test'),registry='registry')
         status=Mock();persist=Mock()
         with patch.dict(N,{'prepare_context':Mock(return_value=ctx),'stage_products':Mock(return_value=dict.fromkeys(N['WEATHER_KEYS'],1)),
             'ensure_state':Mock(),'_active_id':Mock(return_value='same'),'stage_status':status,'preflight_and_write':persist,'record_failure':Mock()}),patch('src.validation.gold.validate_latest'):
@@ -169,7 +171,7 @@ class GoldTests(unittest.TestCase):
         rid='a'*32
         pointer=[{'singleton':1,'release_id':rid,'generation':3,'writer_token':None,'writer_stage':None,'deployment_contract':'contract'}]
         receipt={'release_id':rid,'contract_id':'c'*64,'source_config_id':'d'*64,'evidence_id':'e'*64,
-            'input_versions':json.dumps({str(i):0 for i in range(9)}),'eligible_paths':'[]','settings':GoldConfig().json(),
+            'input_versions':json.dumps({str(i):0 for i in range(9)}),'eligible_paths':'[]','settings':GoldConfig(catalog='weather_api_test').json(),
             'expected_predecessor':'','expected_generation':0,'publication_state':'PUBLISHED','health':'HEALTHY','built_at':datetime.now(timezone.utc),'published_at':datetime.now(timezone.utc),'verified_at':datetime.now(timezone.utc)}
         stages=[{'release_id':rid,'stage_name':stage,'status':'VALIDATED','completed_at':datetime.now(timezone.utc),
                  'output_versions':json.dumps(dict.fromkeys(products,0)),'counts_json':json.dumps(dict.fromkeys(products,0))} for stage,products in STAGE_PRODUCTS.items()]
@@ -200,7 +202,7 @@ class GoldTests(unittest.TestCase):
     def test_writer_acquisition_is_conditional_and_busy_owner_is_not_cleared(self):
         from unittest.mock import Mock,patch
         db=Mock();db.query.side_effect=[[],[{'writer_token':'other'}]]
-        ctx={'db':db,'cfg':GoldConfig()}
+        ctx={'db':db,'cfg':GoldConfig(catalog='weather_api_test')}
         with patch.dict(N,{'controls':Mock()}),self.assertRaises(ValidationError):N['acquire_writer'](ctx,'weather')
         self.assertIn('AND writer_token IS NULL',db.query.call_args_list[0].args[0])
         self.assertNotIn('writer_token',ctx)
@@ -208,11 +210,11 @@ class GoldTests(unittest.TestCase):
     def test_activation_requires_verified_prior_and_generation(self):
         from unittest.mock import Mock
         db=PointerDB('old');prior=Mock(side_effect=ValidationError('prior corrupt'))
-        with self.assertRaises(ValidationError):N['activate_release'](db,GoldConfig(),'new','old',lambda:None,generation=0,writer_token='writer',verify_prior=prior)
+        with self.assertRaises(ValidationError):N['activate_release'](db,GoldConfig(catalog='weather_api_test'),'new','old',lambda:None,generation=0,writer_token='writer',verify_prior=prior)
         self.assertEqual((db.active,db.generation),('old',0))
-        activate_release(db,GoldConfig(),'new','old',lambda:None)
+        activate_release(db,GoldConfig(catalog='weather_api_test'),'new','old',lambda:None)
         self.assertEqual(db.generation,1)
-        activate_release(db,GoldConfig(),'new','new',lambda:None)
+        activate_release(db,GoldConfig(catalog='weather_api_test'),'new','new',lambda:None)
         self.assertEqual(db.generation,1)
 
     def test_weather_task_value_success_validate_only_and_failure(self):
@@ -279,13 +281,13 @@ class GoldTests(unittest.TestCase):
         node=next(x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name=='preflight_and_write')
         body=ast.get_source_segment('\n'.join(cells),node)
         self.assertNotIn('DELETE FROM',body);self.assertIn('if active!=rid:',body);self.assertIn('require_writer(ctx)',body)
-        history=N['copy_view_queries'](GoldConfig(),'weather_current_latest')['weather_current_latest_history']
+        history=N['copy_view_queries'](GoldConfig(catalog='weather_api_test'),'weather_current_latest')['weather_current_latest_history']
         self.assertIn("publication_state='PUBLISHED'",history);self.assertIn("health='HEALTHY'",history)
 
     def test_active_failure_records_unhealthy_without_rewriting_data(self):
         from unittest.mock import Mock
         db=Mock();db.query.side_effect=[[{'writer_token':'owner','release_id':'a'*32}],[]]
-        ctx={'db':db,'cfg':GoldConfig(),'release_id':'a'*32,'writer_token':'owner','write_stage':'weather','failure_mutations_allowed':True}
+        ctx={'db':db,'cfg':GoldConfig(catalog='weather_api_test'),'release_id':'a'*32,'writer_token':'owner','write_stage':'weather','failure_mutations_allowed':True}
         N['record_failure'](ctx,ValidationError('copy mismatch'))
         statement=db.query.call_args.args[0]
         self.assertIn("health='UNHEALTHY'",statement);self.assertNotIn('DELETE',statement);self.assertNotIn('SET release_id',statement)
@@ -294,17 +296,17 @@ class GoldTests(unittest.TestCase):
         from unittest.mock import Mock
         from src.validation.gold import validate_view_definition
         db=Mock();db.query.return_value=[{'table_type':'VIEW','comment':'weather-pipeline Gold v2','table_owner':'owner','control_owner':'owner','view_definition':"SELECT 'HEALTHY' status"}]
-        validate_view_definition(db,GoldConfig(),'example',"select 'HEALTHY' status",'v2')
+        validate_view_definition(db,GoldConfig(catalog='weather_api_test'),'example',"select 'HEALTHY' status",'v2')
         for expected in ["select 'healthy' status","select 'OTHER' status"]:
-            with self.assertRaises(ValidationError):validate_view_definition(db,GoldConfig(),'example',expected,'v2')
+            with self.assertRaises(ValidationError):validate_view_definition(db,GoldConfig(catalog='weather_api_test'),'example',expected,'v2')
         db.query.return_value[0]['table_owner']='foreign'
-        with self.assertRaises(ValidationError):validate_view_definition(db,GoldConfig(),'example',"SELECT 'HEALTHY' status",'v2')
+        with self.assertRaises(ValidationError):validate_view_definition(db,GoldConfig(catalog='weather_api_test'),'example',"SELECT 'HEALTHY' status",'v2')
 
     def test_empty_provision_plan_is_pure_and_has_fenced_schema(self):
         from unittest.mock import patch
         root=Path(__file__).resolve().parents[1]
         with patch('socket.socket',side_effect=RuntimeError('network forbidden')):
-            plan=N['migration_plan'](project_root=root)
+            plan=N['migration_plan'](project_root=root,gold=GoldConfig(catalog='weather_api_test'))
         self.assertEqual(plan['mode'],'FIRST_RUN_EMPTY_STATE')
         self.assertEqual(len(plan['sql']),5)
         text=' '.join(plan['sql'])
@@ -315,7 +317,7 @@ class GoldTests(unittest.TestCase):
     def test_persisted_dependency_corruption_blocks_rollback_authorization(self):
         from unittest.mock import Mock,patch
         db=Mock();db.query.return_value=[{'stage_name':s,'status':'VALIDATED','output_versions':json.dumps({s:4})} for s in ('weather','air_quality','earthquakes')]
-        ctx={'db':db,'cfg':GoldConfig()}
+        ctx={'db':db,'cfg':GoldConfig(catalog='weather_api_test')}
         with patch('src.validation.gold.reconcile',side_effect=ValidationError('corrupted backing')):
             with self.assertRaises(ValidationError):N['verify_release_copies'](ctx,'a'*32)
         self.assertEqual(ctx['suspect_release'],'a'*32)
@@ -325,7 +327,7 @@ class GoldTests(unittest.TestCase):
         class Context(dict):
             def close(self):self['closed']=True
         ctx=Context(release_id='candidate',sources={('weather',k):'source' for k in ('current','hourly','daily')},
-            stages={name:'stage' for name in N['WEATHER_KEYS']},report={},db=Mock(),cfg=GoldConfig(),registry='registry')
+            stages={name:'stage' for name in N['WEATHER_KEYS']},report={},db=Mock(),cfg=GoldConfig(catalog='weather_api_test'),registry='registry')
         def status(*args,**kw):
             if args[2]=='VALIDATED':raise RuntimeError('receipt failed after write')
         status_mock=Mock(side_effect=status);persist=Mock();failure=Mock()
@@ -357,11 +359,11 @@ class GoldTests(unittest.TestCase):
     def test_rejected_stale_or_invalid_invocation_does_not_withdraw_history(self):
         from unittest.mock import Mock
         db=Mock()
-        N['record_failure']({'db':db,'cfg':GoldConfig(),'release_id':'a'*32,'writer_token':'owner'},ValidationError('stale parameter'))
+        N['record_failure']({'db':db,'cfg':GoldConfig(catalog='weather_api_test'),'release_id':'a'*32,'writer_token':'owner'},ValidationError('stale parameter'))
         db.query.assert_not_called()
 
     def test_disposable_destination_is_tightly_scoped(self):
-        cfg=GoldConfig(schema='gold_verify_0123456789ab').validate()
+        cfg=GoldConfig(catalog='weather_api_test', schema='gold_verify_0123456789ab').validate()
         root=Path(__file__).resolve().parents[1]
         plan=N['migration_plan'](project_root=root,gold=cfg)
         self.assertTrue(all('weather_api_test.gold.' not in q for q in plan['sql']))
@@ -370,11 +372,11 @@ class GoldTests(unittest.TestCase):
         for q in (N['air_quality_views'](mapping)|N['earthquake_views'](mapping)|N['copy_view_queries'](cfg,'dim_location')).values():
             self.assertNotIn('weather_api_test.gold.',q)
         for schema in ('silver','reference','pipeline_state','gold_verify_x','gold_verify_0123456789AB','gold_verify_0123456789ab.extra'):
-            with self.subTest(schema=schema),self.assertRaises(ValidationError):GoldConfig(schema=schema).validate()
+            with self.subTest(schema=schema),self.assertRaises(ValidationError):GoldConfig(catalog='weather_api_test', schema=schema).validate()
 
     def test_recovery_requires_evidence_before_any_database_action(self):
         from unittest.mock import Mock
-        ctx={'db':Mock(),'cfg':GoldConfig(schema='gold_verify_0123456789ab')}
+        ctx={'db':Mock(),'cfg':GoldConfig(catalog='weather_api_test', schema='gold_verify_0123456789ab')}
         for kwargs in ({},{'confirmed_terminated':True},{'confirmed_terminated':False,'termination_evidence':'age exceeded a timeout'}):
             with self.assertRaises(ValidationError):N['recover_writer'](ctx,expected_token='old',**kwargs)
         ctx['db'].query.assert_not_called()
@@ -384,14 +386,14 @@ class GoldTests(unittest.TestCase):
         from src.validation.gold import validate_control_rows
         p,r,s=self.controls_fixture();r[0].update(publication_state='LEGACY_ACTIVE',health='UNKNOWN',verified_at=None)
         validate_control_rows(p,r,s,contract='contract')
-        q=N['copy_view_queries'](GoldConfig(),'dim_location')
+        q=N['copy_view_queries'](GoldConfig(catalog='weather_api_test'),'dim_location')
         self.assertIn("publication_state='LEGACY_ACTIVE'",q['dim_location'])
         self.assertNotIn("publication_state='LEGACY_ACTIVE'",q['dim_location_history'])
 
     def test_migration_plan_scope_digest_and_transition_checks(self):
         import hashlib,copy
         from src.validation.gold import validate_migration_plan,validate_migration_transition
-        cfg=GoldConfig(schema='gold_verify_0123456789ab')
+        cfg=GoldConfig(catalog='weather_api_test', schema='gold_verify_0123456789ab')
         plan={'target':cfg.catalog+'.'+cfg.schema,'contract':'test','baseline':{},'sql':['UPDATE '+cfg.table('_gold_active')+' SET generation=1']}
         plan['migration_id']=hashlib.sha256(json.dumps(plan,sort_keys=True).encode()).hexdigest()
         validate_migration_plan(plan,cfg)
@@ -408,6 +410,7 @@ class GoldTests(unittest.TestCase):
         with self.assertRaises(ValidationError):validate_migration_transition(before,after,plan['sql'][0])
         after['versions']['other']=2;after['objects']['other']='foreign change'
         with self.assertRaises(ValidationError):validate_migration_transition(before,after,plan['sql'][0])
+
 
     def test_migration_journal_uses_byte_safe_json_and_qualified_restore(self):
         payload={'sql':["SELECT '\\n', 'quoted'"],'text':'line1\nline2'}
@@ -429,3 +432,61 @@ class PointerDB:
         generation=int(re.search(r'AND generation=(\d+)',q).group(1))
         if self.active==condition and self.generation==generation:self.active=target;self.generation+=1
         return []
+
+
+class ApprovedCatalogAndSelectionTests(unittest.TestCase):
+    """Approved production/test Gold catalogs, notebook catalog propagation, and strict selection completeness."""
+
+    def setUp(self):
+        self.root=Path(__file__).resolve().parents[1]
+
+    def test_approved_catalogs_only(self):
+        from src.validation.gold import APPROVED_GOLD_CATALOGS
+        self.assertEqual(set(APPROVED_GOLD_CATALOGS),{'weather_api','weather_api_test'})
+        self.assertEqual(GoldConfig(catalog='weather_api').validate().schema,'gold')
+        self.assertEqual(GoldConfig(catalog='weather_api_test').validate().schema,'gold')
+
+    def test_production_disposable_schema_rejected_and_blank_fails(self):
+        with self.assertRaises(ValidationError):GoldConfig(catalog='weather_api',schema='gold_verify_0123456789ab').validate()
+        with self.assertRaises(ValidationError):GoldConfig(catalog='').validate()
+        for catalog in ('weather_api','weather_api_test'):
+            with self.assertRaises(ValidationError):GoldConfig(catalog=catalog,schema='silver').validate()
+
+    def test_all_three_notebooks_propagate_catalog(self):
+        for name in ('weather_gold','air_quality_gold','earthquakes_gold'):
+            nb=json.loads((self.root/f'notebooks/gold/{name}.ipynb').read_text())
+            sources=''.join(''.join(c.get('source',[])) if isinstance(c.get('source'),list) else c.get('source','') for c in nb['cells'] if c.get('cell_type')=='code')
+            self.assertTrue(("dbutils.widgets.get('catalog')" in sources) or ('dbutils.widgets.get("catalog")' in sources),msg=name)
+            self.assertTrue(("dbutils.widgets.text('catalog','')" in sources) or ('dbutils.widgets.text("catalog", "")' in sources),msg=name)
+
+    def test_selection_completeness_rejects_subsets_and_extras(self):
+        from src.validation.location_registry import validate_selection_completeness
+        validate_selection_completeness([1,2,3],[1,2,3])
+        for selected,enabled in ([[1,2],[1,2,3]],[[1,2,3,4],[1,2,3]],[[1,1,2],[1,2]],[[],[1]],[[1,2],[]]):
+            with self.subTest(selected=selected,enabled=enabled):
+                with self.assertRaises(ValidationError):validate_selection_completeness(selected,enabled)
+
+    def test_country_cells_reference_and_attribution_rules(self):
+        # Reference resolution: exact table name, fail-closed on missing/invalid columns.
+        from src.validation.gold import country_cells_relation
+        ok=[{'column_name':c,'data_type':t} for c,t in (('cell','BIGINT'),('country_code','STRING'),('country_name','STRING'))]
+        ctx={'db':SimpleNamespace(query=lambda sql:ok),'silver':SimpleNamespace(catalog='weather_api',reference_schema='reference')}
+        self.assertEqual(country_cells_relation(ctx),'weather_api.reference.country_h3_cells')
+        for broken in ([{'column_name':'cell','data_type':'INT'}],[],
+                       [{'column_name':c,'data_type':t} for c,t in (('cell','BIGINT'),('country_code','BIGINT'),('country_name','STRING'))]):
+            with self.subTest(broken=broken):
+                with self.assertRaises(ValidationError):
+                    country_cells_relation({'db':SimpleNamespace(query=lambda sql:broken),'silver':SimpleNamespace(catalog='weather_api',reference_schema='reference')})
+        # Seismic SQL: country columns are always emitted, and an optional country
+        # relation is joined on H3 cells when provided.
+        seismic_sql=N['seismic']('rel')
+        self.assertIn("'UNASSIGNED' country_code",seismic_sql)
+        joined=N['seismic']('rel','weather_api.reference.country_h3_cells')
+        self.assertIn('LEFT JOIN weather_api.reference.country_h3_cells c',joined)
+        self.assertIn('h3_longlatash3(s.longitude,s.latitude,6)',joined)
+        self.assertIn("coalesce(c.country_code,'UNASSIGNED') country_code",joined)
+        # The earthquakes notebook wires the reference table and attribution check.
+        nb=json.loads((self.root/'notebooks/gold/earthquakes_gold.ipynb').read_text())
+        sources=''.join(''.join(c.get('source',[])) if isinstance(c.get('source'),list) else c.get('source','') for c in nb['cells'] if c.get('cell_type')=='code')
+        self.assertIn('checks.country_cells_relation(ctx)',sources)
+        self.assertIn("checks.validate_country_attribution(ctx['db'],ctx['stages']['seismic_events_latest'])",sources)

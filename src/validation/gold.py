@@ -30,9 +30,51 @@ for n in ('alder_pollen','birch_pollen','grass_pollen','mugwort_pollen','olive_p
 AQ_UNITS.update(aerosol_optical_depth='',uv_index='',uv_index_clear_sky='',european_aqi='EAQI',us_aqi='USAQI')
 for n in ('carbon_monoxide','nitrogen_dioxide','ozone','pm10','pm2_5','sulphur_dioxide'):AQ_UNITS['us_aqi_'+n]='USAQI'
 
+# Explicitly approved Gold deployment catalogs: weather_api_test (test) and
+# weather_api (production). Synthetic/disposable verification schemas stay
+# test-only; production always writes to the canonical gold schema.
+APPROVED_GOLD_CATALOGS=frozenset({'weather_api_test','weather_api'})
+
+def country_cells_relation(ctx):
+    """Resolve the precomputed country H3 land-cell reference table for seismic
+    country attribution (public-domain Natural Earth 110m admin-0 boundaries,
+    polyfilled to H3 resolution 6). Fails closed when the table or its required
+    columns are missing, so an unattributed Gold release can never be written."""
+    silver=ctx['silver']
+    table=f'{silver.catalog}.{silver.reference_schema}.country_h3_cells'
+    columns={r['column_name']:r['data_type'] for r in ctx['db'].query(
+        f"SELECT column_name,data_type FROM {silver.catalog}.information_schema.columns "
+        f"WHERE table_schema='{silver.reference_schema}' AND table_name='country_h3_cells'")}
+    require(columns.get('cell')=='BIGINT' and columns.get('country_code')=='STRING' and columns.get('country_name')=='STRING',
+            'Country land-cell reference table missing or invalid; provision '
+            '<catalog>.reference.country_h3_cells (cell BIGINT, country_code STRING, '
+            'country_name STRING) from the documented Natural Earth 110m boundaries',
+            stage='gold_country')
+    return table
+
+def validate_country_attribution(db,relation):
+    """Every seismic event carries an explicit country attribution: either an ISO
+    3166-1 alpha-3 code (Natural Earth ADM0_A3) or the explicit UNASSIGNED value for
+    offshore/unmatched events. NULL or malformed attribution fails the stage."""
+    row=db.query(f'''SELECT count(*) total,
+        count_if(country_code IS NULL OR country_name IS NULL) null_attribution,
+        count_if(country_code='UNASSIGNED') unassigned,
+        count_if(country_code<>'UNASSIGNED' AND NOT rlike(country_code,'^[A-Z][A-Z][A-Z]$')) malformed
+      FROM {relation}''')[0]
+    require(row['null_attribution']==0,'Seismic events with NULL country attribution',stage='gold_country')
+    require(row['malformed']==0,"Seismic country_code must be ISO 3166-1 alpha-3 or 'UNASSIGNED'",stage='gold_country')
+    return {'total':row['total'],'unassigned':row['unassigned'],
+            'assigned':row['total']-row['unassigned']}
+
 def validate_gold_config(settings):
-    require(settings['catalog']=='weather_api_test' and (settings['schema']=='gold' or bool(re.fullmatch(r'gold_verify_[0-9a-f]{12}',settings['schema']))),
-            'Only weather_api_test.gold or disposable gold_verify_<12 lowercase hex> schemas are supported',stage='gold_config')
+    require(settings['catalog'] in APPROVED_GOLD_CATALOGS,
+            'Only approved Gold catalogs are supported: '+','.join(sorted(APPROVED_GOLD_CATALOGS)),stage='gold_config')
+    if settings['catalog']=='weather_api_test':
+        require(settings['schema']=='gold' or bool(re.fullmatch(r'gold_verify_[0-9a-f]{12}',settings['schema'])),
+                'Only weather_api_test.gold or disposable gold_verify_<12 lowercase hex> schemas are supported',stage='gold_config')
+    else:
+        require(settings['schema']=='gold',
+                'Production Gold must use the canonical gold schema; disposable verification schemas are test-only',stage='gold_config')
     for key in ('nearby_radius_km','alignment_seconds','grid_degrees','stale_seconds'):
         v=settings[key];require(type(v) in (int,float) and math.isfinite(v) and v>0,'Invalid Gold setting: '+key,stage='gold_config')
     require(settings['nearby_radius_km']<=20000 and settings['grid_degrees']<=30 and
