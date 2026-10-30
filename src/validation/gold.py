@@ -45,9 +45,12 @@ def country_cells_relation(ctx):
     columns={r['column_name']:r['data_type'] for r in ctx['db'].query(
         f"SELECT column_name,data_type FROM {silver.catalog}.information_schema.columns "
         f"WHERE table_schema='{silver.reference_schema}' AND table_name='country_h3_cells'")}
-    require(columns.get('cell')=='BIGINT' and columns.get('country_code')=='STRING' and columns.get('country_name')=='STRING',
+    # BIGINT (SQL DDL name) and LONG (the name Unity Catalog information_schema
+    # reports for the same 64-bit signed integer) are equivalent; accept both so
+    # the fail-closed reference check matches real catalog metadata.
+    require(columns.get('cell') in ('BIGINT','LONG') and columns.get('country_code')=='STRING' and columns.get('country_name')=='STRING',
             'Country land-cell reference table missing or invalid; provision '
-            '<catalog>.reference.country_h3_cells (cell BIGINT, country_code STRING, '
+            '<catalog>.reference.country_h3_cells (cell BIGINT/LONG, country_code STRING, '
             'country_name STRING) from the documented Natural Earth 110m boundaries',
             stage='gold_country')
     return table

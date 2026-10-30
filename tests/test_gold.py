@@ -472,6 +472,9 @@ class ApprovedCatalogAndSelectionTests(unittest.TestCase):
         ok=[{'column_name':c,'data_type':t} for c,t in (('cell','BIGINT'),('country_code','STRING'),('country_name','STRING'))]
         ctx={'db':SimpleNamespace(query=lambda sql:ok),'silver':SimpleNamespace(catalog='weather_api',reference_schema='reference')}
         self.assertEqual(country_cells_relation(ctx),'weather_api.reference.country_h3_cells')
+        # Unity Catalog information_schema reports 64-bit integers as LONG; both names must pass.
+        ok_long=[{'column_name':c,'data_type':t} for c,t in (('cell','LONG'),('country_code','STRING'),('country_name','STRING'))]
+        self.assertEqual(country_cells_relation({'db':SimpleNamespace(query=lambda sql:ok_long),'silver':SimpleNamespace(catalog='weather_api',reference_schema='reference')}),'weather_api.reference.country_h3_cells')
         for broken in ([{'column_name':'cell','data_type':'INT'}],[],
                        [{'column_name':c,'data_type':t} for c,t in (('cell','BIGINT'),('country_code','BIGINT'),('country_name','STRING'))]):
             with self.subTest(broken=broken):
@@ -490,3 +493,103 @@ class ApprovedCatalogAndSelectionTests(unittest.TestCase):
         sources=''.join(''.join(c.get('source',[])) if isinstance(c.get('source'),list) else c.get('source','') for c in nb['cells'] if c.get('cell_type')=='code')
         self.assertIn('checks.country_cells_relation(ctx)',sources)
         self.assertIn("checks.validate_country_attribution(ctx['db'],ctx['stages']['seismic_events_latest'])",sources)
+        # Stage receipt counts must be flat non-negative ints (Gold v2 controls validation);
+        # nested attribution results are flattened into country_attribution_* keys.
+        self.assertIn("counts.update({'country_attribution_'+k:v",sources)
+        self.assertNotIn("counts['country_attribution']=",sources)
+
+class _UpgradeRow(dict):
+    def asDict(self,recursive=False):return dict(self)
+
+class _UpgradeDB:
+    """Conditional-update semantics for the contract-upgrade executor; not a SQL engine."""
+    def __init__(self,pointer,releases,stages,journal=False):
+        self.pointer=dict(pointer);self.releases=[dict(r) for r in releases];self.stages=[dict(s) for s in stages]
+        self.journal=journal;self.statements=[]
+    def query(self,q):
+        if q.startswith('UPDATE'):
+            self.statements.append(q)
+            m=re.search(r"SET deployment_contract='([0-9a-f]{64})' WHERE singleton=1 AND release_id='' AND writer_token IS NULL AND deployment_contract='([0-9a-f]{64})'",q)
+            if m and self.pointer['deployment_contract']==m.group(2):self.pointer['deployment_contract']=m.group(1)
+            return []
+        if q.startswith('SHOW TBLPROPERTIES'):return [_UpgradeRow(key='weather_pipeline.gold.contract',value='gold-notebooks-v2')]
+        if 'information_schema.tables' in q:
+            name=re.search(r"table_name='([^']+)'",q).group(1)
+            return ([_UpgradeRow(table_name='_gold_migration')] if self.journal else []) if name=='_gold_migration' else [_UpgradeRow(table_name=name)]
+        if q.endswith('._gold_active'):return [_UpgradeRow(self.pointer)]
+        if q.endswith('._gold_releases'):return [_UpgradeRow(r) for r in self.releases]
+        if q.endswith('._gold_stages'):return [_UpgradeRow(s) for s in self.stages]
+        raise AssertionError('unexpected query: '+q)
+
+class GoldContractUpgradeTests(unittest.TestCase):
+    """Contract-upgrade recovery executor: idle-deployment fence and candidate preservation."""
+
+    def setUp(self):
+        self.root=Path(__file__).resolve().parents[1]
+        self.old='8f3a1433dd41798e9393c5bef720b5cb310fa6bdff242cab28a7dc855f4f5f1c'
+        settings=json.dumps({'catalog':'weather_api','schema':'gold','nearby_radius_km':250.0,'alignment_seconds':900.0,'grid_degrees':2.0,'stale_seconds':10800.0,'max_runs':100})
+        self.failed={'release_id':'a'*32,'publication_state':'FAILED','health':'UNHEALTHY','expected_generation':0,'expected_predecessor':'',
+            'contract_id':'b'*64,'source_config_id':'c'*64,'evidence_id':'d'*64,'built_at':'2026-10-29 05:00:00',
+            'input_versions':json.dumps({'k%d'%i:i for i in range(9)}),'eligible_paths':json.dumps(['s1','s2']),'settings':settings}
+        self.failed_stage={'release_id':'a'*32,'stage_name':'earthquakes','status':'FAILED','completed_at':'2026-10-29 05:00:00','output_versions':'','counts_json':''}
+        self.pointer={'singleton':1,'release_id':'','generation':0,'writer_token':None,'writer_stage':None,'writer_acquired_at':None,'deployment_contract':self.old}
+
+    def _session(self,db):
+        return SimpleNamespace(sql=lambda q: SimpleNamespace(collect=lambda rows=db.query(q): rows))
+
+    def _upgrade(self,db,expected=None):
+        return N['upgrade_deployment_contract'](self._session(db),project_root=str(self.root),config_path='config/production.json',gold=GoldConfig(catalog='weather_api'),expected_contract=expected or self.old)
+
+    def _expect_failure(self,db,fragment,expected=None):
+        from src.validation.gold import ValidationError
+        with self.assertRaises(ValidationError) as cm:
+            self._upgrade(db,expected=expected)
+        self.assertIn(fragment,str(cm.exception))
+        self.assertFalse([q for q in db.statements if q.startswith('UPDATE')])
+
+    def _validated_stages(self,rid):
+        from src.validation import gold as _g
+        rows=[]
+        for stage in sorted(_g.STAGE_PRODUCTS):
+            products=sorted(_g.STAGE_PRODUCTS[stage])
+            rows.append({'release_id':rid,'stage_name':stage,'status':'VALIDATED','completed_at':'2026-10-29 05:00:00',
+                'output_versions':json.dumps({k:0 for k in products}),'counts_json':json.dumps({k:1 for k in products})})
+        return rows
+
+    def test_idle_upgrade_repins_pointer_and_preserves_candidates(self):
+        db=_UpgradeDB(self.pointer,[self.failed],[self.failed_stage])
+        res=self._upgrade(db)
+        self.assertEqual(res['upgraded_from'],self.old)
+        self.assertEqual(res['contract'],N['notebook_contract'](str(self.root)))
+        self.assertNotEqual(res['contract'],self.old)
+        self.assertEqual(res['generation'],self.pointer['generation'])
+        self.assertEqual(res['candidates_preserved'],[self.failed['release_id']])
+        self.assertEqual(db.pointer['deployment_contract'],res['contract'])
+        updates=[q for q in db.statements if q.startswith('UPDATE')]
+        self.assertEqual(len(updates),1)
+        self.assertIn('_gold_active',updates[0]);self.assertNotIn('_gold_releases',updates[0]);self.assertNotIn('_gold_stages',updates[0])
+        self.assertIn("release_id=''",updates[0]);self.assertIn('writer_token IS NULL',updates[0])
+
+    def test_fails_closed_on_active_writer(self):
+        pointer=dict(self.pointer,writer_token='writer',writer_stage='weather')
+        self._expect_failure(_UpgradeDB(pointer,[self.failed],[self.failed_stage]),'never upgrade mid-run')
+
+    def test_fails_closed_on_active_release(self):
+        published=dict(self.failed,release_id='e'*32,publication_state='PUBLISHED',health='HEALTHY',published_at='2026-10-29 05:00:00',verified_at='2026-10-29 05:05:00')
+        pointer=dict(self.pointer,release_id='e'*32)
+        self._expect_failure(_UpgradeDB(pointer,[self.failed,published],[self.failed_stage]+self._validated_stages('e'*32)),'idle pointer')
+
+    def test_fails_closed_on_ready_candidate(self):
+        ready=dict(self.failed,publication_state='READY',health='HEALTHY')
+        self._expect_failure(_UpgradeDB(self.pointer,[ready],self._validated_stages(ready['release_id'])),'READY candidate')
+
+    def test_fails_closed_on_wrong_expected_contract(self):
+        pointer=dict(self.pointer,deployment_contract='9'*64)
+        self._expect_failure(_UpgradeDB(pointer,[self.failed],[self.failed_stage]),'expected old contract')
+
+    def test_fails_closed_when_migration_journal_present(self):
+        self._expect_failure(_UpgradeDB(self.pointer,[self.failed],[self.failed_stage],journal=True),'Migration journal present')
+
+    def test_rejects_noop_upgrade(self):
+        current=N['notebook_contract'](str(self.root))
+        self._expect_failure(_UpgradeDB(self.pointer,[self.failed],[self.failed_stage]),'nothing to upgrade',expected=current)
